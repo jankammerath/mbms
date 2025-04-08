@@ -1,0 +1,21 @@
+# Screenshots directory
+screenshots/
+*.jpg
+
+# Go build and debug files
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+debug/
+debug.test
+
+# IDE specific files
+.idea/
+.vscode/
+*.swp
+*.swo
+*.swn

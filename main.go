@@ -3,158 +3,166 @@ package main
 import (
 	"bufio"
 	"fmt"
-	"io"
+	"html/template"
 	"log"
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"strconv"
 	"strings"
-
-	"github.com/gosimple/slug"
+	"sync"
+	"time"
 )
-
-const M3U_FILE = "channels.m3u"
-const VIDEO_FILE_EXT = ".mov"
-
-func main() {
-	channels, err := parseM3U(M3U_FILE)
-	if err != nil {
-		log.Fatalf("Failed to parse M3U file: %v", err)
-	}
-
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		var channelListHTML strings.Builder
-		channelListHTML.WriteString("<h1>Channels</h1><ul>")
-		for _, channel := range channels {
-			encodedName := slug.Make(channel.Name) + VIDEO_FILE_EXT // URL-encode the channel name
-			channelListHTML.WriteString(fmt.Sprintf("<li><a href=\"/%s\">%s</a></li>", encodedName, channel.Name))
-		}
-		channelListHTML.WriteString("</ul>")
-		fmt.Fprint(w, channelListHTML.String())
-	})
-
-	for _, channel := range channels {
-		channelURL := "/" + slug.Make(channel.Name) + VIDEO_FILE_EXT // URL-encode the channel name
-		http.HandleFunc(channelURL, func(w http.ResponseWriter, r *http.Request) {
-			// Construct FFmpeg command Quicktime
-			ffmpegCmd := []string{
-				"ffmpeg",
-				"-i", channel.URL,
-				"-c:v", "svq1",
-				"-s", "640x360",
-				"-aspect", "16:9",
-				"-r", "25",
-				"-b:v", "320k",
-				"-c:a", "aac",
-				"-ar", "44100",
-				"-ac", "2",
-				"-b:a", "128k",
-				"-f", "mov",
-				"-", // Output to stdout
-			}
-
-			cmd := exec.Command(ffmpegCmd[0], ffmpegCmd[1:]...)
-			stdout, err := cmd.StdoutPipe()
-			if err != nil {
-				log.Printf("Error creating stdout pipe: %v", err)
-				http.Error(w, "Internal Server Error", http.StatusInternalServerError)
-				return
-			}
-			stderr, err := cmd.StderrPipe()
-			if err != nil {
-				log.Printf("Error creating stderr pipe: %v", err)
-				http.Error(w, "Internal Server Error", http.StatusInternalServerError)
-				return
-			}
-
-			if err := cmd.Start(); err != nil {
-				log.Printf("Error starting FFmpeg: %v", err)
-				http.Error(w, "Internal Server Error", http.StatusInternalServerError)
-				return
-			}
-
-			// Log FFmpeg's stderr
-			go func() {
-				scanner := bufio.NewScanner(stderr)
-				for scanner.Scan() {
-					log.Printf("FFmpeg stderr: %s", scanner.Text())
-				}
-			}()
-
-			// Set appropriate headers for streaming WMV
-			w.Header().Set("Content-Type", "video/quicktime") // or "video/wmv"
-			w.Header().Set("Transfer-Encoding", "chunked")    // Enable chunked transfer
-
-			// Stream the output to the client
-			buffer := make([]byte, 4096)
-			for {
-				bytesRead, err := stdout.Read(buffer)
-				if err != nil {
-					if err != io.EOF {
-						log.Printf("Error reading from FFmpeg: %v", err)
-					}
-					break
-				}
-				_, err = w.Write(buffer[:bytesRead])
-				if err != nil {
-					log.Printf("Error writing to client: %v", err)
-					break // Client disconnected
-				}
-				if f, ok := w.(http.Flusher); ok {
-					f.Flush() // Flush the buffer to the client
-				}
-			}
-
-			err = cmd.Wait()
-			if err != nil {
-				log.Printf("FFmpeg finished with error: %v", err)
-			} else {
-				log.Println("FFmpeg finished successfully")
-			}
-		})
-	}
-
-	fmt.Println("Server listening on port 8080")
-	log.Fatal(http.ListenAndServe(":8080", nil))
-}
 
 type Channel struct {
 	Name string
 	URL  string
 }
 
+type TemplateData struct {
+	Channels []Channel
+	Time     string
+}
+
+var (
+	channels     []Channel
+	screenshotMu sync.Mutex
+)
+
 func parseM3U(filename string) ([]Channel, error) {
 	file, err := os.Open(filename)
 	if err != nil {
-		return nil, fmt.Errorf("failed to open file: %w", err)
+		return nil, err
 	}
 	defer file.Close()
 
-	data, err := io.ReadAll(file)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read file: %w", err)
-	}
-
-	lines := strings.Split(string(data), "\n")
 	var channels []Channel
+	scanner := bufio.NewScanner(file)
 	var currentChannel Channel
 
-	for i := 0; i < len(lines); i++ {
-		line := strings.TrimSpace(lines[i])
-
-		if strings.HasPrefix(line, "#EXTINF:") {
-			// Extract channel name
-			parts := strings.SplitN(line, ",", 2)
-			if len(parts) > 1 {
-				currentChannel.Name = strings.TrimSpace(parts[1])
-			}
+	for scanner.Scan() {
+		line := scanner.Text()
+		if strings.HasPrefix(line, "#EXTINF:-1,") {
+			currentChannel.Name = strings.TrimPrefix(line, "#EXTINF:-1,")
 		} else if !strings.HasPrefix(line, "#") && line != "" {
-			// Assume this is the URL
-			currentChannel.URL = strings.TrimSpace(line)
+			currentChannel.URL = line
 			channels = append(channels, currentChannel)
-			currentChannel = Channel{} // Reset for the next channel
+			currentChannel = Channel{}
 		}
 	}
-
-	return channels, nil
+	return channels, scanner.Err()
 }
+
+func captureScreenshots() {
+	for {
+		screenshotMu.Lock()
+		for i, channel := range channels {
+			outputPath := filepath.Join("screenshots", fmt.Sprintf("channel_%d.jpg", i))
+			cmd := exec.Command("ffmpeg", "-y", "-i", channel.URL,
+				"-vframes", "1", "-q:v", "2", outputPath)
+			if err := cmd.Run(); err != nil {
+				log.Printf("Error capturing screenshot for %s: %v", channel.Name, err)
+				continue
+			}
+		}
+		screenshotMu.Unlock()
+		time.Sleep(5 * time.Minute)
+	}
+}
+
+func transcodeHandler(w http.ResponseWriter, r *http.Request) {
+	channelIndex := r.URL.Query().Get("channel")
+	if channelIndex == "" {
+		http.Error(w, "Channel parameter required", http.StatusBadRequest)
+		return
+	}
+
+	idx, err := strconv.Atoi(channelIndex)
+	if err != nil || idx < 0 || idx >= len(channels) {
+		http.Error(w, "Invalid channel index", http.StatusBadRequest)
+		return
+	}
+
+	ch := channels[idx]
+	cmd := exec.Command("ffmpeg", "-i", ch.URL,
+		"-c:v", "wmv2", "-c:a", "wmav2",
+		"-f", "asf", "-")
+
+	cmd.Stdout = w
+	w.Header().Set("Content-Type", "video/x-ms-asf")
+	w.Header().Set("Content-Disposition", "inline; filename=stream.asf")
+
+	if err := cmd.Run(); err != nil {
+		log.Printf("Transcoding error: %v", err)
+		http.Error(w, "Transcoding failed", http.StatusInternalServerError)
+		return
+	}
+}
+
+func checkFFmpeg() error {
+	cmd := exec.Command("ffmpeg", "-version")
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("ffmpeg not found: %v", err)
+	}
+	return nil
+}
+
+func main() {
+	if err := checkFFmpeg(); err != nil {
+		log.Fatal(err)
+	}
+
+	var err error
+	channels, err = parseM3U("channels.m3u")
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	if err := os.MkdirAll("screenshots", 0755); err != nil {
+		log.Fatal(err)
+	}
+
+	go captureScreenshots()
+
+	http.HandleFunc("/stream", transcodeHandler)
+	http.Handle("/screenshots/", http.StripPrefix("/screenshots/", http.FileServer(http.Dir("screenshots"))))
+
+	tmpl := template.Must(template.New("index").Parse(indexHTML))
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		data := TemplateData{
+			Channels: channels,
+			Time:     time.Now().Format("2006-01-02 15:04:05"),
+		}
+		tmpl.Execute(w, data)
+	})
+
+	log.Println("Server starting on http://localhost:8080")
+	log.Fatal(http.ListenAndServe(":8080", nil))
+}
+
+const indexHTML = `<!DOCTYPE html PUBLIC "-//W3C//DTD HTML 3.2//EN">
+<html>
+<head>
+<title>TV Channel Viewer</title>
+<meta http-equiv="refresh" content="300">
+</head>
+<body bgcolor="#FFFFFF">
+<h1>TV Channel List</h1>
+<p>Last updated: {{.Time}}</p>
+<table border="1" cellpadding="5" cellspacing="0">
+<tr>
+<th>Channel</th>
+<th>Preview</th>
+<th>Action</th>
+</tr>
+{{range $i, $channel := .Channels}}
+<tr>
+<td>{{$channel.Name}}</td>
+<td><img src="/screenshots/channel_{{$i}}.jpg" width="160" height="90" alt="{{$channel.Name}} preview"></td>
+<td><a href="/stream?channel={{$i}}">Watch in WMP</a></td>
+</tr>
+{{end}}
+</table>
+</body>
+</html>`
