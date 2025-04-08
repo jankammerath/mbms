@@ -16,7 +16,7 @@ import (
 	"time"
 )
 
-const VideoFileExtension = ".mov"
+const VideoFileExtension = ".wmv"
 
 type Channel struct {
 	Name string
@@ -81,13 +81,13 @@ func captureScreenshots() {
 	}
 }
 
-func writeSMIL(w http.ResponseWriter, channel Channel, baseURL string) {
-	fmt.Fprintf(w, `<!DOCTYPE smil PUBLIC "-//W3C//DTD SMIL 1.0//EN" "http://www.w3.org/TR/REC-smil/SMIL10.dtd">
-<smil>
-<body>
-<video src="%s/stream/%s%s"/>
-</body>
-</smil>`, baseURL, channel.Slug, VideoFileExtension)
+func writeASX(w http.ResponseWriter, channel Channel, baseURL string) {
+	fmt.Fprintf(w, `<?xml version="1.0" encoding="UTF-8"?>
+<asx version="3.0">
+	<entry>
+		<ref href="%s/stream/%s%s"/>
+	</entry>
+</asx>`, baseURL, channel.Slug, VideoFileExtension)
 }
 
 func findChannelBySlug(slug string) (*Channel, bool) {
@@ -110,7 +110,7 @@ func streamHandler(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("Stream request from %s for channel %s (%s)", r.RemoteAddr, channel.Name, r.URL.Path)
 
-	w.Header().Set("Content-Type", "video/quicktime")
+	w.Header().Set("Content-Type", "video/x-ms-wmv")
 	w.Header().Set("Connection", "close")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Accept-Ranges", "bytes")
@@ -118,14 +118,12 @@ func streamHandler(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("Starting FFmpeg transcoding for channel %s", channel.Name)
 	cmd := exec.Command("ffmpeg", "-v", "verbose", "-re", "-i", channel.URL,
-		"-c:v", "svq1",
-		"-q:v", "1",
-		"-c:a", "aac",
-		"-profile:a", "aac_low",
-		"-b:a", "128k",
-		"-vf", "scale=320:240",
+		"-c:v", "msmpeg4v3",
 		"-b:v", "300k",
-		"-f", "mpegts",
+		"-c:a", "wmav2",
+		"-b:a", "128k",
+		"-vf", "scale=640:360",
+		"-f", "asf",
 		"-")
 
 	var stderr bytes.Buffer
@@ -140,17 +138,17 @@ func streamHandler(w http.ResponseWriter, r *http.Request) {
 	log.Printf("Stream ended for channel %s", channel.Name)
 }
 
-func smilHandler(w http.ResponseWriter, r *http.Request) {
-	slug := strings.TrimPrefix(r.URL.Path, "/smil/")
-	slug = strings.TrimSuffix(slug, ".smil")
+func asxHandler(w http.ResponseWriter, r *http.Request) {
+	slug := strings.TrimPrefix(r.URL.Path, "/asx/")
+	slug = strings.TrimSuffix(slug, ".asx")
 	channel, found := findChannelBySlug(slug)
 	if !found {
 		http.NotFound(w, r)
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/smil")
-	writeSMIL(w, *channel, "http://"+r.Host)
+	w.Header().Set("Content-Type", "video/x-ms-asf")
+	writeASX(w, *channel, "http://"+r.Host)
 }
 
 func checkFFmpeg() error {
@@ -179,7 +177,7 @@ func main() {
 	go captureScreenshots()
 
 	http.HandleFunc("/stream/", streamHandler)
-	http.HandleFunc("/smil/", smilHandler)
+	http.HandleFunc("/asx/", asxHandler)
 	http.Handle("/screenshots/", http.StripPrefix("/screenshots/", http.FileServer(http.Dir("screenshots"))))
 
 	tmpl := template.Must(template.New("index").Parse(indexHTML))
@@ -215,7 +213,7 @@ const indexHTML = `<!DOCTYPE html PUBLIC "-//W3C//DTD HTML 3.2//EN">
 <tr>
 <td>{{$channel.Name}}</td>
 <td><img src="/screenshots/{{$channel.Slug}}.jpg" width="160" height="90" alt="{{$channel.Name}} preview"></td>
-<td><a href="/smil/{{$channel.Slug}}.smil">Watch in QuickTime</a></td>
+<td><a href="/asx/{{$channel.Slug}}.asx">Watch in Windows Media Player</a></td>
 </tr>
 {{end}}
 </table>
