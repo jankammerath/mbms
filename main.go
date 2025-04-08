@@ -126,7 +126,7 @@ func streamHandler(w http.ResponseWriter, r *http.Request) {
 
 func smilHandler(w http.ResponseWriter, r *http.Request) {
 	slug := strings.TrimPrefix(r.URL.Path, "/smil/")
-	slug = strings.TrimSuffix(slug, ".smi")
+	slug = strings.TrimSuffix(slug, ".smil")
 	channel, found := findChannelBySlug(slug)
 	if !found {
 		http.NotFound(w, r)
@@ -199,7 +199,7 @@ const indexHTML = `<!DOCTYPE html PUBLIC "-//W3C//DTD HTML 3.2//EN">
 <tr>
 <td>{{$channel.Name}}</td>
 <td><img src="/screenshots/{{$channel.Slug}}.jpg" width="160" height="90" alt="{{$channel.Name}} preview"></td>
-<td><a href="/smil/{{$channel.Slug}}.smi">Watch in QuickTime</a></td>
+<td><a href="/smil/{{$channel.Slug}}.smil">Watch in QuickTime</a></td>
 </tr>
 {{end}}
 </table>
