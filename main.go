@@ -47,6 +47,10 @@ const (
 	// Additional commands seen in WMPMac logs
 	MMS_COMMAND_3F000001 = 0x3F000001
 	MMS_COMMAND_4B000001 = 0x4B000001
+	MMS_COMMAND_B3000001 = 0xB3000001
+	MMS_COMMAND_34000001 = 0x34000001
+	MMS_COMMAND_23000001 = 0x23000001
+	MMS_COMMAND_B2000001 = 0xB2000001
 )
 
 // MMSHeader represents an MMS protocol header
@@ -229,7 +233,8 @@ func handleGenericMMSCommand(conn net.Conn, header MMSHeader, data []byte) {
 		respCmdID = MMS_CONNECT_RESP
 	case MMS_START_PLAY, MMS_COMMAND_1F000000:
 		respCmdID = MMS_START_PLAY_RESP
-	case MMS_COMMAND_3F000001, MMS_COMMAND_4B000001:
+	case MMS_COMMAND_3F000001, MMS_COMMAND_4B000001, MMS_COMMAND_B3000001,
+		MMS_COMMAND_34000001, MMS_COMMAND_23000001, MMS_COMMAND_B2000001:
 		// Handle the WMPMac specific commands - these appear to be connect commands
 		respCmdID = MMS_CONNECT_RESP
 	default:
@@ -237,11 +242,17 @@ func handleGenericMMSCommand(conn net.Conn, header MMSHeader, data []byte) {
 		respCmdID = MMS_CONNECT_RESP
 	}
 
-	// Generic response
+	// Create a more complete MMS header response
 	resp := MMSHeader{
 		CommandID:   respCmdID,
+		Reserved1:   0,
+		Reserved2:   0,
 		MessageLen:  36,
 		SequenceNum: header.SequenceNum + 1,
+		TimeoutVal:  0,
+		Reserved3:   0,
+		Reserved4:   0,
+		Reserved5:   0,
 		MessageLen2: 36,
 	}
 
@@ -274,7 +285,10 @@ func streamToMMSClient(conn net.Conn, channel *Channel) {
 	tmpName := filepath.Join(tempDir, fmt.Sprintf("mms-stream-%s-%d.asf", channel.Slug, time.Now().UnixNano()))
 	log.Printf("Using temporary file: %s", tmpName)
 
-	// First, transcode to the temporary ASF file with improved options for subtitle handling
+	// Send initial MMS headers to client
+	sendMMSProtocolSelection(conn)
+
+	// First, transcode to the temporary ASF file with improved options for WMP compatibility
 	cmd := exec.Command("ffmpeg",
 		"-v", "info", // More verbose logging to diagnose issues
 		"-ignore_unknown", "1",
@@ -295,6 +309,7 @@ func streamToMMSClient(conn net.Conn, channel *Channel) {
 		"-ac", "2",
 		"-vf", "scale=320:240",
 		"-f", "asf", // Format for Windows Media
+		"-asf_stream_properties", "parse_all=true",
 		"-y",    // Overwrite output file
 		tmpName) // Output file
 
@@ -315,7 +330,7 @@ func streamToMMSClient(conn net.Conn, channel *Channel) {
 			time.Sleep(200 * time.Millisecond)
 			info, err := os.Stat(tmpName)
 			if err == nil && info.Size() > 0 {
-				log.Printf("FFmpeg output file created with size: %d bytes")
+				log.Printf("FFmpeg output file created with size: %d bytes", info.Size())
 				outputReady <- true
 				return
 			}
@@ -340,9 +355,10 @@ func streamToMMSClient(conn net.Conn, channel *Channel) {
 		return
 	}
 
+	// Let FFmpeg finish creating the header
+	time.Sleep(1 * time.Second)
+
 	// If we get here, the file was created successfully
-	// Let's try a simpler approach: terminate FFmpeg and then read the complete file
-	log.Printf("Output file created, terminating FFmpeg process")
 	cmd.Process.Kill()
 	cmd.Wait()
 
@@ -354,6 +370,9 @@ func streamToMMSClient(conn net.Conn, channel *Channel) {
 	}
 	log.Printf("Output file size: %d bytes", fileInfo.Size())
 
+	// Send MMS file header
+	sendMMSHeaderStart(conn)
+
 	// Open the file and stream it to the client
 	file, err := os.Open(tmpName)
 	if err != nil {
@@ -363,8 +382,26 @@ func streamToMMSClient(conn net.Conn, channel *Channel) {
 	defer file.Close()
 	defer os.Remove(tmpName)
 
-	log.Printf("Starting to stream file to client")
-	buffer := make([]byte, 8192)
+	// Send ASF header packets first
+	headerBuf := make([]byte, 8192) // Larger buffer for ASF header
+	n, err := file.Read(headerBuf)
+	if err != nil {
+		log.Printf("Error reading ASF header: %v", err)
+		return
+	}
+
+	// Send the ASF header as an MMS_DATA_PACKET
+	sendMMSDataPacket(conn, headerBuf[:n], 0)
+
+	// Send MMS header end
+	sendMMSHeaderEnd(conn)
+
+	// Now send the actual data packets
+	log.Printf("Starting to stream file content to client")
+	packetSize := 4096
+	buffer := make([]byte, packetSize)
+	packetNumber := uint32(1) // Start packet numbering after header packet
+
 	for {
 		n, err := file.Read(buffer)
 		if err == io.EOF {
@@ -376,14 +413,166 @@ func streamToMMSClient(conn net.Conn, channel *Channel) {
 			break
 		}
 
-		_, err = conn.Write(buffer[:n])
-		if err != nil {
-			log.Printf("Error writing to MMS connection: %v", err)
-			break
-		}
+		// Send as MMS data packet
+		sendMMSDataPacket(conn, buffer[:n], packetNumber)
+		packetNumber++
+
+		// Small delay between packets to prevent overwhelming the client
+		time.Sleep(20 * time.Millisecond)
 	}
 
+	// Send end of stream marker
+	sendMMSEndOfStream(conn)
+
 	log.Printf("MMS stream ended for %s to %s", channel.Name, conn.RemoteAddr())
+}
+
+// sendMMSProtocolSelection sends the protocol selection command to the client
+func sendMMSProtocolSelection(conn net.Conn) {
+	header := MMSHeader{
+		CommandID:   MMS_PROTOCOL_SELECT,
+		Reserved1:   0,
+		Reserved2:   0,
+		MessageLen:  36,
+		SequenceNum: 1,
+		TimeoutVal:  0,
+		Reserved3:   0,
+		Reserved4:   0,
+		Reserved5:   0,
+		MessageLen2: 36,
+	}
+
+	buf := new(bytes.Buffer)
+	if err := binary.Write(buf, binary.LittleEndian, header); err != nil {
+		log.Printf("Error creating MMS protocol selection header: %v", err)
+		return
+	}
+
+	if _, err := conn.Write(buf.Bytes()); err != nil {
+		log.Printf("Error sending MMS protocol selection header: %v", err)
+		return
+	}
+
+	log.Printf("Sent MMS protocol selection header")
+}
+
+// sendMMSHeaderStart informs the client that the header data is coming
+func sendMMSHeaderStart(conn net.Conn) {
+	header := MMSHeader{
+		CommandID:   MMS_HEADER_START,
+		Reserved1:   0,
+		Reserved2:   0,
+		MessageLen:  36,
+		SequenceNum: 2,
+		TimeoutVal:  0,
+		Reserved3:   0,
+		Reserved4:   0,
+		Reserved5:   0,
+		MessageLen2: 36,
+	}
+
+	buf := new(bytes.Buffer)
+	if err := binary.Write(buf, binary.LittleEndian, header); err != nil {
+		log.Printf("Error creating MMS header start: %v", err)
+		return
+	}
+
+	if _, err := conn.Write(buf.Bytes()); err != nil {
+		log.Printf("Error sending MMS header start: %v", err)
+		return
+	}
+
+	log.Printf("Sent MMS header start")
+}
+
+// sendMMSHeaderEnd signals the end of header data
+func sendMMSHeaderEnd(conn net.Conn) {
+	header := MMSHeader{
+		CommandID:   MMS_HEADER_END,
+		Reserved1:   0,
+		Reserved2:   0,
+		MessageLen:  36,
+		SequenceNum: 3,
+		TimeoutVal:  0,
+		Reserved3:   0,
+		Reserved4:   0,
+		Reserved5:   0,
+		MessageLen2: 36,
+	}
+
+	buf := new(bytes.Buffer)
+	if err := binary.Write(buf, binary.LittleEndian, header); err != nil {
+		log.Printf("Error creating MMS header end: %v", err)
+		return
+	}
+
+	if _, err := conn.Write(buf.Bytes()); err != nil {
+		log.Printf("Error sending MMS header end: %v", err)
+		return
+	}
+
+	log.Printf("Sent MMS header end")
+}
+
+// sendMMSDataPacket sends actual media data to the client
+func sendMMSDataPacket(conn net.Conn, data []byte, packetNumber uint32) {
+	header := MMSHeader{
+		CommandID:   MMS_DATA_PACKET,
+		Reserved1:   0,
+		Reserved2:   0,
+		MessageLen:  uint32(len(data) + 36),
+		SequenceNum: packetNumber,
+		TimeoutVal:  0,
+		Reserved3:   0,
+		Reserved4:   0,
+		Reserved5:   0,
+		MessageLen2: uint32(len(data) + 36),
+	}
+
+	buf := new(bytes.Buffer)
+	if err := binary.Write(buf, binary.LittleEndian, header); err != nil {
+		log.Printf("Error creating MMS data packet header: %v", err)
+		return
+	}
+
+	if _, err := conn.Write(buf.Bytes()); err != nil {
+		log.Printf("Error sending MMS data packet header: %v", err)
+		return
+	}
+
+	if _, err := conn.Write(data); err != nil {
+		log.Printf("Error sending MMS data packet data: %v", err)
+		return
+	}
+}
+
+// sendMMSEndOfStream signals the end of the stream
+func sendMMSEndOfStream(conn net.Conn) {
+	header := MMSHeader{
+		CommandID:   MMS_END_OF_STREAM,
+		Reserved1:   0,
+		Reserved2:   0,
+		MessageLen:  36,
+		SequenceNum: 4,
+		TimeoutVal:  0,
+		Reserved3:   0,
+		Reserved4:   0,
+		Reserved5:   0,
+		MessageLen2: 36,
+	}
+
+	buf := new(bytes.Buffer)
+	if err := binary.Write(buf, binary.LittleEndian, header); err != nil {
+		log.Printf("Error creating MMS end of stream header: %v", err)
+		return
+	}
+
+	if _, err := conn.Write(buf.Bytes()); err != nil {
+		log.Printf("Error sending MMS end of stream header: %v", err)
+		return
+	}
+
+	log.Printf("Sent MMS end of stream header")
 }
 
 func writeASX(w http.ResponseWriter, channel Channel, host string) {
