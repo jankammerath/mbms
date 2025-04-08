@@ -3,9 +3,12 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"encoding/binary"
+	"encoding/hex"
 	"fmt"
 	"html/template"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -19,7 +22,42 @@ import (
 const (
 	VideoFileExtension = ".asx"
 	MMSProtocol        = "mms://" // MMS protocol prefix
+	MMSPort            = 1755     // Standard MMS port
 )
+
+// MMS protocol command types - expanded list based on MS-MMS protocol
+const (
+	MMS_CONNECT         = 0x00000001
+	MMS_CONNECT_RESP    = 0x00000002
+	MMS_PROTOCOL_SELECT = 0x00000003
+	MMS_START_PLAY      = 0x00000007
+	MMS_START_PLAY_RESP = 0x00000008
+	MMS_DATA_PACKET     = 0x00000020
+	MMS_END_OF_STREAM   = 0x00000021
+	// Extended MMS commands
+	MMS_HEADER_START = 0xB0000000
+	MMS_HEADER_END   = 0xB1000000
+	// Common received commands from WMP
+	MMS_COMMAND_0FB00000 = 0x0FB00000
+	MMS_COMMAND_0F000000 = 0x0F000000
+	MMS_COMMAND_1F000000 = 0x1F000000
+	MMS_COMMAND_B0000000 = 0xB0000000
+	MMS_COMMAND_B1000000 = 0xB1000000
+)
+
+// MMSHeader represents an MMS protocol header
+type MMSHeader struct {
+	CommandID   uint32
+	Reserved1   uint32
+	Reserved2   uint32
+	MessageLen  uint32
+	SequenceNum uint32
+	TimeoutVal  uint32
+	Reserved3   uint32
+	Reserved4   uint32
+	Reserved5   uint32
+	MessageLen2 uint32
+}
 
 type Channel struct {
 	Name string
@@ -84,14 +122,205 @@ func captureScreenshots() {
 	}
 }
 
+func startMMSServer() {
+	log.Printf("Starting MMS server on port %d", MMSPort)
+
+	// Listen on the MMS port
+	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", MMSPort))
+	if err != nil {
+		log.Fatalf("Failed to start MMS server: %v", err)
+	}
+
+	defer listener.Close()
+
+	for {
+		conn, err := listener.Accept()
+		if err != nil {
+			log.Printf("Error accepting connection: %v", err)
+			continue
+		}
+
+		// Handle each MMS connection in a goroutine
+		go handleMMSConnection(conn)
+	}
+}
+
+func handleMMSConnection(conn net.Conn) {
+	defer conn.Close()
+
+	remoteAddr := conn.RemoteAddr().String()
+	log.Printf("New MMS connection from %s", remoteAddr)
+
+	// Buffer for reading MMS headers
+	buf := make([]byte, 4096)
+
+	// Read the initial MMS command
+	n, err := conn.Read(buf)
+	if err != nil {
+		log.Printf("Error reading from connection %s: %v", remoteAddr, err)
+		return
+	}
+
+	// Dump the raw received data in hex for debugging
+	log.Printf("Received %d bytes from %s", n, remoteAddr)
+	log.Printf("Raw data: %s", hex.Dump(buf[:n]))
+
+	// Check if we have enough data for an MMS header
+	if n < 40 {
+		log.Printf("Received too short message from %s (%d bytes)", remoteAddr, n)
+		return
+	}
+
+	var header MMSHeader
+	headerBuf := bytes.NewBuffer(buf[:40])
+	err = binary.Read(headerBuf, binary.LittleEndian, &header)
+	if err != nil {
+		log.Printf("Error parsing MMS header from %s: %v", remoteAddr, err)
+		return
+	}
+
+	log.Printf("MMS command received from %s: CommandID=0x%08X", remoteAddr, header.CommandID)
+
+	// Handle any command ID - respond with a generic MMS response
+	handleGenericMMSCommand(conn, header, buf[40:n])
+}
+
+func handleGenericMMSCommand(conn net.Conn, header MMSHeader, data []byte) {
+	remoteAddr := conn.RemoteAddr().String()
+	cmdID := header.CommandID
+
+	// Try to extract URL if present in the data
+	url := ""
+	for i := 0; i < len(data); i++ {
+		if data[i] >= 32 && data[i] <= 127 {
+			url += string(data[i])
+		}
+	}
+	log.Printf("Possible URL or data content: %s", url)
+
+	// Extract any potential channel from the URL or data
+	var channel *Channel
+	var found bool
+
+	// Try to find the channel by parsing the URL
+	for _, ch := range channels {
+		if strings.Contains(url, ch.Slug) {
+			channel = &ch
+			found = true
+			break
+		}
+	}
+
+	// If no channel found, pick the first one as a fallback
+	if !found && len(channels) > 0 {
+		ch := channels[0]
+		channel = &ch
+		found = true
+	}
+
+	// Create a response header based on the command ID
+	var respCmdID uint32
+	switch cmdID {
+	case MMS_CONNECT, MMS_COMMAND_0FB00000, MMS_COMMAND_0F000000:
+		respCmdID = MMS_CONNECT_RESP
+	case MMS_START_PLAY, MMS_COMMAND_1F000000:
+		respCmdID = MMS_START_PLAY_RESP
+	default:
+		// For any other command, just acknowledge with connect response
+		respCmdID = MMS_CONNECT_RESP
+	}
+
+	// Generic response
+	resp := MMSHeader{
+		CommandID:   respCmdID,
+		MessageLen:  36,
+		SequenceNum: header.SequenceNum + 1,
+		MessageLen2: 36,
+	}
+
+	// Write response header
+	respBuf := new(bytes.Buffer)
+	if err := binary.Write(respBuf, binary.LittleEndian, resp); err != nil {
+		log.Printf("Error creating MMS response: %v", err)
+		return
+	}
+
+	if _, err := conn.Write(respBuf.Bytes()); err != nil {
+		log.Printf("Error sending MMS response: %v", err)
+		return
+	}
+
+	log.Printf("Sent MMS response 0x%08X to %s", respCmdID, remoteAddr)
+
+	if found {
+		streamToMMSClient(conn, channel)
+	} else {
+		log.Printf("No channel found to stream for %s", remoteAddr)
+	}
+}
+
+func streamToMMSClient(conn net.Conn, channel *Channel) {
+	log.Printf("Starting MMS stream for channel %s to %s", channel.Name, conn.RemoteAddr())
+
+	// Stream the content using FFmpeg with options to completely ignore subtitles
+	cmd := exec.Command("ffmpeg",
+		"-v", "warning",
+		"-re",
+		"-ignore_unknown", "1", // Ignore unknown streams including subtitles
+		"-i", channel.URL,
+		"-c:v", "wmv1", // Use WMV1 codec for better WMP7 compatibility
+		"-b:v", "300k",
+		"-r", "25", // 25 fps
+		"-g", "250", // Keyframe every 10 seconds
+		"-bf", "0", // No B-frames
+		"-c:a", "wmav1", // WMA version 1 for better compatibility
+		"-b:a", "64k", // Lower audio bitrate for stability
+		"-ar", "44100", // Standard audio rate
+		"-ac", "2", // Stereo
+		"-vf", "scale=320:240", // Lower resolution for better performance
+		"-f", "asf", // ASF container format
+		"-sn",                 // Skip subtitles
+		"-dn",                 // Skip data streams
+		"-packetsize", "2048", // Appropriate packet size
+		"-strict", "unofficial", // Allow unofficial features
+		"-fflags", "+genpts+discardcorrupt", // Handle problematic streams better
+		"-max_muxing_queue_size", "1024", // Increase queue size
+		"-map", "0:v:0", // Map only first video stream
+		"-map", "0:a:0", // Map only first audio stream
+		"-")
+
+	cmd.Stdout = conn
+
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+
+	// Start the FFmpeg process
+	if err := cmd.Run(); err != nil {
+		if !strings.Contains(err.Error(), "broken pipe") &&
+			!strings.Contains(err.Error(), "connection reset") {
+			log.Printf("Error streaming to MMS client: %v\nFFmpeg output: %s", err, stderr.String())
+		} else {
+			log.Printf("MMS client disconnected from %s stream", channel.Name)
+		}
+	}
+
+	log.Printf("MMS stream ended for %s to %s", channel.Name, conn.RemoteAddr())
+}
+
 func writeASX(w http.ResponseWriter, channel Channel, host string) {
+	// Extract host without port if necessary
+	hostOnly := host
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		hostOnly = h
+	}
+
 	// Create a Windows Media Player compatible ASX file with MMS protocol
 	fmt.Fprintf(w, `<ASX VERSION="3.0">
 <ENTRY>
 <TITLE>%s</TITLE>
-<REF HREF="%s%s/stream/%s.wmv"/>
+<REF HREF="%s%s:%d/%s.wmv"/>
 </ENTRY>
-</ASX>`, channel.Name, MMSProtocol, host, channel.Slug)
+</ASX>`, channel.Name, MMSProtocol, hostOnly, MMSPort, channel.Slug)
 }
 
 func findChannelBySlug(slug string) (*Channel, bool) {
@@ -155,35 +384,42 @@ func streamHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	log.Printf("--- End Request Details ---")
 
-	// Set headers for Windows Media Player compatibility with MMS protocol
-	w.Header().Set("Content-Type", "video/x-ms-wmv")
-	w.Header().Set("Connection", "keep-alive")
+	// Special headers for Windows Media Player 7
+	w.Header().Set("Content-Type", "application/x-mms-framed")
+	w.Header().Set("Server", "WMServer/9.0")
 	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Pragma", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Server-Name", "Windows Media Server")
+	w.Header().Set("Content-Length", "") // Force chunked transfer
 	w.(http.Flusher).Flush()
 
-	log.Printf("Starting FFmpeg transcoding for channel %s", channel.Name)
+	log.Printf("Starting FFmpeg transcoding for channel %s using MMS protocol", channel.Name)
 
-	// Use FFmpeg with settings optimized for Windows Media Player 7 with MMS protocol
+	// Use FFmpeg with settings optimized specifically for Windows Media Player 7
 	cmd := exec.Command("ffmpeg",
+		"-v", "info",
+		"-re",
 		"-i", channel.URL,
-		"-c:v", "msmpeg4v3",
+		"-c:v", "wmv1", // Use WMV1 codec for better WMP7 compatibility
 		"-b:v", "300k",
-		"-r", "25", // Reduce framerate to 25fps
-		"-g", "250", // Keyframe every 10 seconds at 25fps
-		"-bf", "0", // No B-frames for better compatibility
-		"-c:a", "wmav2",
-		"-b:a", "128k",
-		"-ar", "44100", // 44.1kHz audio sample rate
-		"-ac", "2", // Stereo audio
-		"-vf", "scale=640:360",
-		"-f", "asf", // ASF container for WMV/WMA
-		"-packetsize", "3200",
-		"-map", "0:v:0", // Map the first video stream
-		"-map", "0:a:0", // Map the first audio stream
-		"-sn",                        // Skip subtitles
-		"-max_interleave_delta", "0", // Reduce interleave delta for more resilience
-		"-flush_packets", "1", // Flush packets immediately
-		"-muxdelay", "0", // No mux delay
+		"-r", "25", // 25 fps
+		"-g", "250", // Keyframe every 10 seconds
+		"-bf", "0", // No B-frames
+		"-qmin", "2", // Minimum quantizer
+		"-qmax", "31", // Maximum quantizer
+		"-c:a", "wmav1", // WMA version 1 for better compatibility
+		"-b:a", "64k", // Lower audio bitrate for stability
+		"-ar", "44100", // Standard audio rate
+		"-ac", "2", // Stereo
+		"-vf", "scale=320:240", // Smaller resolution for better performance
+		"-f", "asf",
+		"-packetsize", "2048", // Smaller packet size
+		"-movflags", "faststart",
+		"-fflags", "+genpts+ignidx",
+		"-sn",           // Skip subtitles
+		"-map", "0:v:0", // Map first video stream
+		"-map", "0:a:0", // Map first audio stream
 		"-")
 
 	var stderr bytes.Buffer
@@ -191,8 +427,10 @@ func streamHandler(w http.ResponseWriter, r *http.Request) {
 	cmd.Stdout = w
 
 	if err := cmd.Run(); err != nil {
-		// Ignore broken pipe errors (client disconnected) to avoid flooding logs
-		if !strings.Contains(err.Error(), "broken pipe") && !strings.Contains(err.Error(), "exit status 224") {
+		// Ignore common disconnection errors
+		if !strings.Contains(err.Error(), "broken pipe") &&
+			!strings.Contains(err.Error(), "exit status 224") &&
+			!strings.Contains(err.Error(), "connection reset") {
 			log.Printf("Transcoding error for %s: %v\nFFmpeg output:\n%s", channel.Name, err, stderr.String())
 		} else {
 			log.Printf("Client disconnected from %s stream", channel.Name)
@@ -241,7 +479,11 @@ func main() {
 
 	go captureScreenshots()
 
-	http.HandleFunc("/stream/", streamHandler)
+	// Start MMS server in a goroutine
+	go startMMSServer()
+
+	// Keep HTTP server for the web interface
+	http.HandleFunc("/stream/", streamHandler) // Keep for backward compatibility
 	http.HandleFunc("/asx/", asxHandler)
 	http.Handle("/screenshots/", http.StripPrefix("/screenshots/", http.FileServer(http.Dir("screenshots"))))
 
@@ -254,7 +496,8 @@ func main() {
 		tmpl.Execute(w, data)
 	})
 
-	log.Println("Server starting on http://localhost:8080")
+	log.Printf("Web server starting on http://localhost:8080")
+	log.Printf("MMS server running on port %d", MMSPort)
 	log.Fatal(http.ListenAndServe(":8080", nil))
 }
 
