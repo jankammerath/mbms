@@ -105,12 +105,14 @@ func streamHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	cmd := exec.Command("ffmpeg", "-i", channel.URL,
-		"-c:v", "svq1", "-c:a", "adpcm_ima_qt",
-		"-s", "240x180", "-b:v", "75k",
+		"-c:v", "mpeg4", "-c:a", "aac",
+		"-profile:v", "0", "-level", "1",
+		"-flags", "+low_delay", "-bf", "0",
+		"-s", "240x180", "-b:v", "96k", "-maxrate", "96k",
 		"-r", "15", "-g", "15",
-		"-ar", "22050", "-ac", "1",
-		"-f", "mov",
-		"-vtag", "SVQ1",
+		"-ar", "44100", "-ac", "2", "-b:a", "64k", "-profile:a", "low",
+		"-f", "mov", "-brand", "qt",
+		"-vtag", "mp4v", "-atag", "mp4a",
 		"-")
 
 	cmd.Stdout = w
