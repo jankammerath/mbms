@@ -104,20 +104,26 @@ func streamHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	cmd := exec.Command("ffmpeg", "-i", channel.URL,
+	w.Header().Set("Content-Type", "video/quicktime")
+	w.Header().Set("Connection", "close")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Accept-Ranges", "bytes")
+	w.Header().Set("Content-Disposition", "inline; filename=stream.mov")
+	w.(http.Flusher).Flush()
+
+	cmd := exec.Command("ffmpeg", "-re", "-i", channel.URL,
 		"-c:v", "mpeg4", "-c:a", "aac",
 		"-profile:v", "0", "-level", "1",
-		"-flags", "+low_delay", "-bf", "0",
-		"-s", "240x180", "-b:v", "96k", "-maxrate", "96k",
+		"-s", "240x180", "-b:v", "96k", "-maxrate", "96k", "-bufsize", "192k",
 		"-r", "15", "-g", "15",
-		"-ar", "44100", "-ac", "2", "-b:a", "64k", "-profile:a", "low",
+		"-ar", "44100", "-ac", "2", "-b:a", "64k", "-profile:a", "1",
+		"-movflags", "+rtphint+faststart",
 		"-f", "mov", "-brand", "qt",
 		"-vtag", "mp4v", "-atag", "mp4a",
+		"-fflags", "+flush_packets",
 		"-")
 
 	cmd.Stdout = w
-	w.Header().Set("Content-Type", "video/quicktime")
-	w.Header().Set("Content-Disposition", "inline; filename=stream.mov")
 
 	if err := cmd.Run(); err != nil {
 		log.Printf("Transcoding error: %v", err)
