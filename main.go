@@ -111,7 +111,7 @@ func streamHandler(w http.ResponseWriter, r *http.Request) {
 	cmd := exec.Command("ffmpeg", "-i", channel.URL,
 		"-c:v", "msmpeg4v1", "-c:a", "wmav1",
 		"-s", "176x144", "-b:v", "32k", "-maxrate", "32k", "-minrate", "32k",
-		"-g", "30", "-qmin", "2", "-qmax", "10",
+		"-r", "25", "-g", "25", "-qmin", "2", "-qmax", "10",
 		"-ar", "8000", "-ac", "1", "-b:a", "8k",
 		"-packetsize", "2324", "-chunk_size", "2324",
 		"-f", "asf", "-strict", "experimental",
