@@ -9,7 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -18,6 +18,7 @@ import (
 type Channel struct {
 	Name string
 	URL  string
+	Slug string
 }
 
 type TemplateData struct {
@@ -29,6 +30,11 @@ var (
 	channels     []Channel
 	screenshotMu sync.Mutex
 )
+
+func createSlug(name string) string {
+	reg := regexp.MustCompile("[^a-zA-Z0-9]+")
+	return strings.ToLower(reg.ReplaceAllString(name, "-"))
+}
 
 func parseM3U(filename string) ([]Channel, error) {
 	file, err := os.Open(filename)
@@ -45,6 +51,7 @@ func parseM3U(filename string) ([]Channel, error) {
 		line := scanner.Text()
 		if strings.HasPrefix(line, "#EXTINF:-1,") {
 			currentChannel.Name = strings.TrimPrefix(line, "#EXTINF:-1,")
+			currentChannel.Slug = createSlug(currentChannel.Name)
 		} else if !strings.HasPrefix(line, "#") && line != "" {
 			currentChannel.URL = line
 			channels = append(channels, currentChannel)
@@ -57,10 +64,10 @@ func parseM3U(filename string) ([]Channel, error) {
 func captureScreenshots() {
 	for {
 		screenshotMu.Lock()
-		for i, channel := range channels {
-			outputPath := filepath.Join("screenshots", fmt.Sprintf("channel_%d.jpg", i))
+		for _, channel := range channels {
+			outputPath := filepath.Join("screenshots", channel.Slug+".jpg")
 			cmd := exec.Command("ffmpeg", "-y", "-i", channel.URL,
-				"-vframes", "1", "-s", "320x240", "-q:v", "2", outputPath)
+				"-vframes", "1", "-s", "240x180", "-q:v", "2", outputPath)
 			if err := cmd.Run(); err != nil {
 				log.Printf("Error capturing screenshot for %s: %v", channel.Name, err)
 				continue
@@ -71,24 +78,37 @@ func captureScreenshots() {
 	}
 }
 
-func transcodeHandler(w http.ResponseWriter, r *http.Request) {
-	channelIndex := r.URL.Query().Get("channel")
-	if channelIndex == "" {
-		http.Error(w, "Channel parameter required", http.StatusBadRequest)
+func writeASX(w http.ResponseWriter, channel Channel, baseURL string) {
+	fmt.Fprintf(w, `<ASX VERSION="3.0">
+<TITLE>%s</TITLE>
+<ENTRY>
+<TITLE>%s</TITLE>
+<REF HREF="%s/stream/%s" />
+</ENTRY>
+</ASX>`, channel.Name, channel.Name, baseURL, channel.Slug)
+}
+
+func findChannelBySlug(slug string) (*Channel, bool) {
+	for _, ch := range channels {
+		if ch.Slug == slug {
+			return &ch, true
+		}
+	}
+	return nil, false
+}
+
+func streamHandler(w http.ResponseWriter, r *http.Request) {
+	slug := strings.TrimPrefix(r.URL.Path, "/stream/")
+	channel, found := findChannelBySlug(slug)
+	if !found {
+		http.NotFound(w, r)
 		return
 	}
 
-	idx, err := strconv.Atoi(channelIndex)
-	if err != nil || idx < 0 || idx >= len(channels) {
-		http.Error(w, "Invalid channel index", http.StatusBadRequest)
-		return
-	}
-
-	ch := channels[idx]
-	cmd := exec.Command("ffmpeg", "-i", ch.URL,
+	cmd := exec.Command("ffmpeg", "-i", channel.URL,
 		"-c:v", "wmv2", "-c:a", "wmav2",
-		"-s", "320x240", "-b:v", "150k", "-b:a", "32k",
-		"-ar", "22050", "-ac", "2",
+		"-s", "240x180", "-b:v", "100k", "-b:a", "32k",
+		"-ar", "22050", "-ac", "1",
 		"-f", "asf", "-")
 
 	cmd.Stdout = w
@@ -100,6 +120,19 @@ func transcodeHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Transcoding failed", http.StatusInternalServerError)
 		return
 	}
+}
+
+func playlistHandler(w http.ResponseWriter, r *http.Request) {
+	slug := strings.TrimPrefix(r.URL.Path, "/playlist/")
+	slug = strings.TrimSuffix(slug, ".asx")
+	channel, found := findChannelBySlug(slug)
+	if !found {
+		http.NotFound(w, r)
+		return
+	}
+
+	w.Header().Set("Content-Type", "video/x-ms-asf")
+	writeASX(w, *channel, "http://"+r.Host)
 }
 
 func checkFFmpeg() error {
@@ -127,7 +160,8 @@ func main() {
 
 	go captureScreenshots()
 
-	http.HandleFunc("/stream", transcodeHandler)
+	http.HandleFunc("/stream/", streamHandler)
+	http.HandleFunc("/playlist/", playlistHandler)
 	http.Handle("/screenshots/", http.StripPrefix("/screenshots/", http.FileServer(http.Dir("screenshots"))))
 
 	tmpl := template.Must(template.New("index").Parse(indexHTML))
@@ -148,6 +182,7 @@ const indexHTML = `<!DOCTYPE html PUBLIC "-//W3C//DTD HTML 3.2//EN">
 <head>
 <title>TV Channel Viewer</title>
 <meta http-equiv="refresh" content="300">
+<meta http-equiv="Content-Type" content="text/html; charset=iso-8859-1">
 </head>
 <body bgcolor="#FFFFFF">
 <h1>TV Channel List</h1>
@@ -158,11 +193,11 @@ const indexHTML = `<!DOCTYPE html PUBLIC "-//W3C//DTD HTML 3.2//EN">
 <th>Preview</th>
 <th>Action</th>
 </tr>
-{{range $i, $channel := .Channels}}
+{{range $channel := .Channels}}
 <tr>
 <td>{{$channel.Name}}</td>
-<td><img src="/screenshots/channel_{{$i}}.jpg" width="160" height="90" alt="{{$channel.Name}} preview"></td>
-<td><a href="/stream?channel={{$i}}">Watch in WMP</a></td>
+<td><img src="/screenshots/{{$channel.Slug}}.jpg" width="160" height="90" alt="{{$channel.Name}} preview"></td>
+<td><a href="/playlist/{{$channel.Slug}}.asx">Watch in WMP</a></td>
 </tr>
 {{end}}
 </table>
