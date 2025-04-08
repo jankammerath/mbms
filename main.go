@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"fmt"
 	"html/template"
 	"log"
@@ -104,6 +105,8 @@ func streamHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	log.Printf("Stream request from %s for channel %s (%s)", r.RemoteAddr, channel.Name, r.URL.Path)
+
 	w.Header().Set("Content-Type", "video/quicktime")
 	w.Header().Set("Connection", "close")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -111,7 +114,8 @@ func streamHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Disposition", "inline; filename=stream.mov")
 	w.(http.Flusher).Flush()
 
-	cmd := exec.Command("ffmpeg", "-re", "-i", channel.URL,
+	log.Printf("Starting FFmpeg transcoding for channel %s", channel.Name)
+	cmd := exec.Command("ffmpeg", "-v", "verbose", "-re", "-i", channel.URL,
 		"-c:v", "mpeg4", "-c:a", "aac",
 		"-profile:v", "0", "-level", "1",
 		"-s", "240x180", "-b:v", "96k", "-maxrate", "96k", "-bufsize", "192k",
@@ -121,15 +125,19 @@ func streamHandler(w http.ResponseWriter, r *http.Request) {
 		"-f", "mov", "-brand", "qt",
 		"-vtag", "mp4v", "-atag", "mp4a",
 		"-fflags", "+flush_packets",
+		"-progress", "pipe:2",
 		"-")
 
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
 	cmd.Stdout = w
 
 	if err := cmd.Run(); err != nil {
-		log.Printf("Transcoding error: %v", err)
+		log.Printf("Transcoding error for %s: %v\nFFmpeg output:\n%s", channel.Name, err, stderr.String())
 		http.Error(w, "Transcoding failed", http.StatusInternalServerError)
 		return
 	}
+	log.Printf("Stream ended for channel %s", channel.Name)
 }
 
 func smilHandler(w http.ResponseWriter, r *http.Request) {
