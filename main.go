@@ -16,6 +16,8 @@ import (
 	"time"
 )
 
+const VideoFileExtension = ".mov"
+
 type Channel struct {
 	Name string
 	URL  string
@@ -83,9 +85,9 @@ func writeSMIL(w http.ResponseWriter, channel Channel, baseURL string) {
 	fmt.Fprintf(w, `<!DOCTYPE smil PUBLIC "-//W3C//DTD SMIL 1.0//EN" "http://www.w3.org/TR/REC-smil/SMIL10.dtd">
 <smil>
 <body>
-<video src="%s/stream/%s"/>
+<video src="%s/stream/%s%s"/>
 </body>
-</smil>`, baseURL, channel.Slug)
+</smil>`, baseURL, channel.Slug, VideoFileExtension)
 }
 
 func findChannelBySlug(slug string) (*Channel, bool) {
@@ -99,6 +101,7 @@ func findChannelBySlug(slug string) (*Channel, bool) {
 
 func streamHandler(w http.ResponseWriter, r *http.Request) {
 	slug := strings.TrimPrefix(r.URL.Path, "/stream/")
+	slug = strings.TrimSuffix(slug, VideoFileExtension)
 	channel, found := findChannelBySlug(slug)
 	if !found {
 		http.NotFound(w, r)
@@ -111,21 +114,18 @@ func streamHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Connection", "close")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Accept-Ranges", "bytes")
-	w.Header().Set("Content-Disposition", "inline; filename=stream.mov")
 	w.(http.Flusher).Flush()
 
 	log.Printf("Starting FFmpeg transcoding for channel %s", channel.Name)
 	cmd := exec.Command("ffmpeg", "-v", "verbose", "-re", "-i", channel.URL,
-		"-c:v", "mpeg4", "-c:a", "aac",
-		"-profile:v", "0", "-level", "1",
-		"-s", "240x180", "-b:v", "96k", "-maxrate", "96k", "-bufsize", "192k",
-		"-r", "15", "-g", "15",
-		"-ar", "44100", "-ac", "2", "-b:a", "64k", "-profile:a", "1",
-		"-movflags", "+rtphint+faststart",
-		"-f", "mov", "-brand", "qt",
-		"-vtag", "mp4v", "-atag", "mp4a",
-		"-fflags", "+flush_packets",
-		"-progress", "pipe:2",
+		"-c:v", "svq1",
+		"-q:v", "1",
+		"-c:a", "aac",
+		"-profile:a", "aac_low",
+		"-b:a", "128k",
+		"-vf", "scale=320:240",
+		"-b:v", "300k",
+		"-f", "mpegts",
 		"-")
 
 	var stderr bytes.Buffer
