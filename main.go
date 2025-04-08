@@ -79,13 +79,16 @@ func captureScreenshots() {
 }
 
 func writeASX(w http.ResponseWriter, channel Channel, baseURL string) {
-	fmt.Fprintf(w, `<ASX VERSION="3.0">
-<TITLE>%s</TITLE>
+	fmt.Fprintf(w, `<ASX VERSION="1.0">
 <ENTRY>
 <TITLE>%s</TITLE>
-<REF HREF="%s/stream/%s" />
+<AUTHOR>vinqttv</AUTHOR>
+<COPYRIGHT>(c) 2025</COPYRIGHT>
+<MOREINFO HREF="about:blank"/>
+<ABSTRACT>Live TV Stream</ABSTRACT>
+<REF HREF="%s/stream/%s"/>
 </ENTRY>
-</ASX>`, channel.Name, channel.Name, baseURL, channel.Slug)
+</ASX>`, channel.Name, baseURL, channel.Slug)
 }
 
 func findChannelBySlug(slug string) (*Channel, bool) {
@@ -106,13 +109,16 @@ func streamHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	cmd := exec.Command("ffmpeg", "-i", channel.URL,
-		"-c:v", "wmv2", "-c:a", "wmav2",
-		"-s", "240x180", "-b:v", "100k", "-b:a", "32k",
-		"-ar", "22050", "-ac", "1",
-		"-f", "asf", "-")
+		"-c:v", "msmpeg4v1", "-c:a", "wmav1",
+		"-s", "176x144", "-b:v", "32k", "-maxrate", "32k", "-minrate", "32k",
+		"-g", "30", "-qmin", "2", "-qmax", "10",
+		"-ar", "8000", "-ac", "1", "-b:a", "8k",
+		"-packetsize", "2324", "-chunk_size", "2324",
+		"-f", "asf", "-strict", "experimental",
+		"-")
 
 	cmd.Stdout = w
-	w.Header().Set("Content-Type", "video/x-ms-asf")
+	w.Header().Set("Content-Type", "application/x-ms-wmv")
 	w.Header().Set("Content-Disposition", "inline; filename=stream.asf")
 
 	if err := cmd.Run(); err != nil {
