@@ -24,10 +24,8 @@ const (
 	VideoFileExtension = ".asx"
 	MMSProtocol        = "mms://" // MMS protocol prefix
 	MMSPort            = 1755     // Standard MMS port
-)
 
-// MMS protocol command types - expanded list based on MS-MMS protocol
-const (
+	// MMS protocol command types - expanded list based on MS-MMS protocol
 	MMS_CONNECT         = 0x00000001
 	MMS_CONNECT_RESP    = 0x00000002
 	MMS_PROTOCOL_SELECT = 0x00000003
@@ -35,15 +33,18 @@ const (
 	MMS_START_PLAY_RESP = 0x00000008
 	MMS_DATA_PACKET     = 0x00000020
 	MMS_END_OF_STREAM   = 0x00000021
+
 	// Extended MMS commands
 	MMS_HEADER_START = 0xB0000000
 	MMS_HEADER_END   = 0xB1000000
+
 	// Common received commands from WMP
 	MMS_COMMAND_0FB00000 = 0x0FB00000
 	MMS_COMMAND_0F000000 = 0x0F000000
 	MMS_COMMAND_1F000000 = 0x1F000000
 	MMS_COMMAND_B0000000 = 0xB0000000
 	MMS_COMMAND_B1000000 = 0xB1000000
+
 	// Additional commands seen in WMPMac logs
 	MMS_COMMAND_3F000001 = 0x3F000001
 	MMS_COMMAND_4B000001 = 0x4B000001
@@ -51,6 +52,26 @@ const (
 	MMS_COMMAND_34000001 = 0x34000001
 	MMS_COMMAND_23000001 = 0x23000001
 	MMS_COMMAND_B2000001 = 0xB2000001
+	MMS_COMMAND_D4000001 = 0xD4000001
+	MMS_COMMAND_84000001 = 0x84000001
+	MMS_COMMAND_AA000001 = 0xAA000001
+	MMS_COMMAND_7F000001 = 0x7F000001
+
+	// Standard MMS protocol message IDs from MS-MMS specification
+	MMS_LinkViewerToMacConnect            = 0x00040001
+	MMS_LinkMacToViewerReportConnectedEX  = 0x00040002
+	MMS_LinkViewerToMacOpenFile           = 0x00040027
+	MMS_LinkMacToViewerReportOpenFile     = 0x00040006
+	MMS_LinkViewerToMacReadBlock          = 0x00040029
+	MMS_LinkViewerToMacStartPlaying       = 0x00040025
+	MMS_LinkMacToViewerReportStartPlaying = 0x00040009
+
+	// MMS protocol message types
+	MMS_MESSAGE_TYPE_DATA    = 0x00000000
+	MMS_MESSAGE_TYPE_END     = 0x00000001
+	MMS_MESSAGE_TYPE_ACK     = 0x00000002
+	MMS_MESSAGE_TYPE_REQUEST = 0x00000003
+	MMS_MESSAGE_TYPE_REPORT  = 0x00000004
 )
 
 // MMSHeader represents an MMS protocol header
@@ -153,6 +174,13 @@ func startMMSServer() {
 	}
 }
 
+// Define the standard MS-MMS specific message structures
+type MMSMessage struct {
+	Header MMSHeader
+	Body   []byte
+}
+
+// handleMMSConnection updated with proper MS-MMS protocol sequence
 func handleMMSConnection(conn net.Conn) {
 	defer conn.Close()
 
@@ -189,13 +217,55 @@ func handleMMSConnection(conn net.Conn) {
 
 	log.Printf("MMS command received from %s: CommandID=0x%08X", remoteAddr, header.CommandID)
 
-	// Handle any command ID - respond with a generic MMS response
-	handleGenericMMSCommand(conn, header, buf[40:n])
+	// Extract client info for better logging
+	clientInfo := extractClientInfo(buf[40:n])
+	if clientInfo != "" {
+		log.Printf("Client info: %s", clientInfo)
+	}
+
+	// This is now a WMPMac connection - proceed with standard MMS protocol
+	handleWMPMacConnection(conn, header, buf[40:n])
 }
 
-func handleGenericMMSCommand(conn net.Conn, header MMSHeader, data []byte) {
+// Extract client information (User-Agent) from the connection data
+func extractClientInfo(data []byte) string {
+	// Extract printable ASCII characters that might represent user agent
+	var info strings.Builder
+	inUserAgent := false
+
+	for i := 0; i < len(data); i++ {
+		// Look for "NSPlayer" string which typically indicates user-agent info
+		if i+7 < len(data) && string(data[i:i+8]) == "NSPlayer" {
+			inUserAgent = true
+		}
+
+		if inUserAgent && data[i] >= 32 && data[i] <= 126 {
+			info.WriteByte(data[i])
+		}
+	}
+
+	return info.String()
+}
+
+// Handle a WMPMac client connection following MS-MMS protocol
+func handleWMPMacConnection(conn net.Conn, header MMSHeader, data []byte) {
+	// In MS-MMS protocol, a client connection typically follows these steps:
+	// 1. Client sends LinkViewerToMacConnect
+	// 2. Server responds with LinkMacToViewerReportConnectedEX
+	// 3. Client sends LinkViewerToMacOpenFile
+	// 4. Server responds with LinkMacToViewerReportOpenFile
+	// 5. Client may send LinkViewerToMacReadBlock for headers
+	// 6. Client sends LinkViewerToMacStartPlaying
+	// 7. Server responds with LinkMacToViewerReportStartPlaying
+	// 8. Server streams data packets
+
 	remoteAddr := conn.RemoteAddr().String()
-	cmdID := header.CommandID
+
+	// We've received a connection request - respond with connect response
+	sendMMSConnectResponse(conn, header.SequenceNum)
+
+	// For WMPMac in the current protocol stage, we can directly start sending
+	// media packets after sending a protocol selection message
 
 	// Try to extract URL if present in the data
 	url := ""
@@ -226,55 +296,56 @@ func handleGenericMMSCommand(conn net.Conn, header MMSHeader, data []byte) {
 		found = true
 	}
 
-	// Create a response header based on the command ID
-	var respCmdID uint32
-	switch cmdID {
-	case MMS_CONNECT, MMS_COMMAND_0FB00000, MMS_COMMAND_0F000000:
-		respCmdID = MMS_CONNECT_RESP
-	case MMS_START_PLAY, MMS_COMMAND_1F000000:
-		respCmdID = MMS_START_PLAY_RESP
-	case MMS_COMMAND_3F000001, MMS_COMMAND_4B000001, MMS_COMMAND_B3000001,
-		MMS_COMMAND_34000001, MMS_COMMAND_23000001, MMS_COMMAND_B2000001:
-		// Handle the WMPMac specific commands - these appear to be connect commands
-		respCmdID = MMS_CONNECT_RESP
-	default:
-		// For any other command, just acknowledge with connect response
-		respCmdID = MMS_CONNECT_RESP
-	}
-
-	// Create a more complete MMS header response
-	resp := MMSHeader{
-		CommandID:   respCmdID,
-		Reserved1:   0,
-		Reserved2:   0,
-		MessageLen:  36,
-		SequenceNum: header.SequenceNum + 1,
-		TimeoutVal:  0,
-		Reserved3:   0,
-		Reserved4:   0,
-		Reserved5:   0,
-		MessageLen2: 36,
-	}
-
-	// Write response header
-	respBuf := new(bytes.Buffer)
-	if err := binary.Write(respBuf, binary.LittleEndian, resp); err != nil {
-		log.Printf("Error creating MMS response: %v", err)
-		return
-	}
-
-	if _, err := conn.Write(respBuf.Bytes()); err != nil {
-		log.Printf("Error sending MMS response: %v", err)
-		return
-	}
-
-	log.Printf("Sent MMS response 0x%08X to %s", respCmdID, remoteAddr)
-
 	if found {
+		// For most complete MMS protocol compliance we should actually:
+		// 1. Wait for LinkViewerToMacOpenFile
+		// 2. Send LinkMacToViewerReportOpenFile
+		// 3. Wait for LinkViewerToMacStartPlaying
+		// 4. Send LinkMacToViewerReportStartPlaying
+
+		// But for WMPMac 7.1 compatibility, we'll use the simplified approach
+		// that just streams the content after the initial connection
 		streamToMMSClient(conn, channel)
 	} else {
 		log.Printf("No channel found to stream for %s", remoteAddr)
 	}
+}
+
+// sendMMSConnectResponse sends an MMS connection response message
+func sendMMSConnectResponse(conn net.Conn, seqNum uint32) {
+	// Clear response message that conforms to MMS protocol expectations
+	response := MMSHeader{
+		CommandID:   MMS_CONNECT_RESP, // 0x00000002
+		Reserved1:   0,
+		Reserved2:   0,
+		MessageLen:  40,
+		SequenceNum: seqNum + 1,
+		TimeoutVal:  0,
+		Reserved3:   0,
+		Reserved4:   0,
+		Reserved5:   0,
+		MessageLen2: 40,
+	}
+
+	respBuf := new(bytes.Buffer)
+	if err := binary.Write(respBuf, binary.LittleEndian, response); err != nil {
+		log.Printf("Error creating MMS connect response: %v", err)
+		return
+	}
+
+	// Add a zero protocol selection at the end (helps with certain clients)
+	protocolSelection := uint32(0)
+	if err := binary.Write(respBuf, binary.LittleEndian, protocolSelection); err != nil {
+		log.Printf("Error adding protocol selection to connect response: %v", err)
+		return
+	}
+
+	if _, err := conn.Write(respBuf.Bytes()); err != nil {
+		log.Printf("Error sending MMS connect response: %v", err)
+		return
+	}
+
+	log.Printf("Sent MMS connect response (0x00000002)")
 }
 
 func streamToMMSClient(conn net.Conn, channel *Channel) {
@@ -718,8 +789,41 @@ func asxHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	w.Header().Set("Content-Type", "video/x-ms-asf")
-	writeASX(w, *channel, r.Host)
+	log.Printf("ASX request for channel: %s from %s", channel.Name, r.RemoteAddr)
+
+	// Set proper content type with explicit charset
+	w.Header().Set("Content-Type", "video/x-ms-asf; charset=utf-8")
+
+	// Set no-cache to ensure fresh content
+	w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+	w.Header().Set("Pragma", "no-cache")
+	w.Header().Set("Expires", "0")
+
+	// Create ASX content
+	content := generateASX(*channel, r.Host)
+
+	// Set explicit content length
+	w.Header().Set("Content-Length", fmt.Sprintf("%d", len(content)))
+
+	// Write the content
+	w.Write([]byte(content))
+}
+
+// Generate ASX content as a string to allow setting proper content length
+func generateASX(channel Channel, host string) string {
+	// Extract host without port if necessary
+	hostOnly := host
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		hostOnly = h
+	}
+
+	// Create a Windows Media Player compatible ASX file with MMS protocol
+	return fmt.Sprintf(`<ASX VERSION="3.0">
+<ENTRY>
+<TITLE>%s</TITLE>
+<REF HREF="%s%s:%d/%s.wmv"/>
+</ENTRY>
+</ASX>`, channel.Name, MMSProtocol, hostOnly, MMSPort, channel.Slug)
 }
 
 func checkFFmpeg() error {
@@ -750,23 +854,81 @@ func main() {
 	// Start MMS server in a goroutine
 	go startMMSServer()
 
-	// Keep HTTP server for the web interface
-	http.HandleFunc("/stream/", streamHandler) // Keep for backward compatibility
-	http.HandleFunc("/asx/", asxHandler)
-	http.Handle("/screenshots/", http.StripPrefix("/screenshots/", http.FileServer(http.Dir("screenshots"))))
+	// Set up HTTP server for the web interface
+	mux := http.NewServeMux()
+	mux.HandleFunc("/stream/", streamHandler)
+	mux.HandleFunc("/asx/", asxHandler)
 
+	// Improved file server for screenshots with better error handling
+	screenshotsPath := "screenshots"
+	fileServer := http.FileServer(http.Dir(screenshotsPath))
+	mux.HandleFunc("/screenshots/", func(w http.ResponseWriter, r *http.Request) {
+		// Log request for debugging
+		log.Printf("Screenshot request: %s", r.URL.Path)
+
+		// Add proper headers for images
+		w.Header().Set("Cache-Control", "max-age=3600")
+
+		// Strip the /screenshots/ prefix before passing to file server
+		r.URL.Path = strings.TrimPrefix(r.URL.Path, "/screenshots/")
+
+		// Check if file exists before serving
+		filePath := filepath.Join(screenshotsPath, r.URL.Path)
+		if _, err := os.Stat(filePath); os.IsNotExist(err) {
+			log.Printf("Screenshot not found: %s", filePath)
+			http.NotFound(w, r)
+			return
+		}
+
+		// Serve the file
+		fileServer.ServeHTTP(w, r)
+	})
+
+	// Set up index page handler
 	tmpl := template.Must(template.New("index").Parse(indexHTML))
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		// Only serve index at root path to prevent conflicts
+		if r.URL.Path != "/" {
+			http.NotFound(w, r)
+			return
+		}
+
+		// Set proper content type for HTML
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+
+		// Force no caching for dynamic content
+		w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+		w.Header().Set("Pragma", "no-cache")
+		w.Header().Set("Expires", "0")
+
 		data := TemplateData{
 			Channels: channels,
 			Time:     time.Now().Format("2006-01-02 15:04:05"),
 		}
-		tmpl.Execute(w, data)
+
+		// Use buffer to render template first to avoid partial renders on error
+		var buf bytes.Buffer
+		if err := tmpl.Execute(&buf, data); err != nil {
+			http.Error(w, fmt.Sprintf("Error rendering template: %v", err), http.StatusInternalServerError)
+			log.Printf("Template error: %v", err)
+			return
+		}
+
+		// If template rendered successfully, write to response
+		buf.WriteTo(w)
 	})
+
+	// Create a separate server instance
+	server := &http.Server{
+		Addr:    ":8080",
+		Handler: mux,
+	}
 
 	log.Printf("Web server starting on http://localhost:8080")
 	log.Printf("MMS server running on port %d", MMSPort)
-	log.Fatal(http.ListenAndServe(":8080", nil))
+
+	// Start the HTTP server
+	log.Fatal(server.ListenAndServe())
 }
 
 const indexHTML = `<!DOCTYPE html PUBLIC "-//W3C//DTD HTML 3.2//EN">
