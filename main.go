@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"html/template"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -262,45 +263,117 @@ func handleGenericMMSCommand(conn net.Conn, header MMSHeader, data []byte) {
 func streamToMMSClient(conn net.Conn, channel *Channel) {
 	log.Printf("Starting MMS stream for channel %s to %s", channel.Name, conn.RemoteAddr())
 
-	// Stream the content using FFmpeg with options to completely ignore subtitles
-	cmd := exec.Command("ffmpeg",
-		"-v", "warning",
-		"-re",
-		"-ignore_unknown", "1", // Ignore unknown streams including subtitles
-		"-i", channel.URL,
-		"-c:v", "wmv1", // Use WMV1 codec for better WMP7 compatibility
-		"-b:v", "300k",
-		"-r", "25", // 25 fps
-		"-g", "250", // Keyframe every 10 seconds
-		"-bf", "0", // No B-frames
-		"-c:a", "wmav1", // WMA version 1 for better compatibility
-		"-b:a", "64k", // Lower audio bitrate for stability
-		"-ar", "44100", // Standard audio rate
-		"-ac", "2", // Stereo
-		"-vf", "scale=320:240", // Lower resolution for better performance
-		"-f", "asf", // ASF container format
-		"-sn",                 // Skip subtitles
-		"-dn",                 // Skip data streams
-		"-packetsize", "2048", // Appropriate packet size
-		"-strict", "unofficial", // Allow unofficial features
-		"-fflags", "+genpts+discardcorrupt", // Handle problematic streams better
-		"-max_muxing_queue_size", "1024", // Increase queue size
-		"-map", "0:v:0", // Map only first video stream
-		"-map", "0:a:0", // Map only first audio stream
-		"-")
+	// Create a temporary file with .asf extension
+	tempDir := os.TempDir()
+	tmpName := filepath.Join(tempDir, fmt.Sprintf("mms-stream-%s-%d.asf", channel.Slug, time.Now().UnixNano()))
+	log.Printf("Using temporary file: %s", tmpName)
 
-	cmd.Stdout = conn
+	// First, transcode to the temporary ASF file with improved options for subtitle handling
+	cmd := exec.Command("ffmpeg",
+		"-v", "info", // More verbose logging to diagnose issues
+		"-ignore_unknown", "1",
+		"-i", channel.URL,
+		"-sn", // Skip subtitles
+		"-dn", // Skip data streams
+		"-max_muxing_queue_size", "1024",
+		"-map", "0:v:0?", // Map only first video stream if available
+		"-map", "0:a:0?", // Map only first audio stream if available
+		"-c:v", "wmv1",
+		"-b:v", "300k",
+		"-r", "25",
+		"-g", "250",
+		"-bf", "0",
+		"-c:a", "wmav1",
+		"-b:a", "64k",
+		"-ar", "44100",
+		"-ac", "2",
+		"-vf", "scale=320:240",
+		"-f", "asf", // Format for Windows Media
+		"-y",    // Overwrite output file
+		tmpName) // Output file
 
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 
-	// Start the FFmpeg process
-	if err := cmd.Run(); err != nil {
-		if !strings.Contains(err.Error(), "broken pipe") &&
-			!strings.Contains(err.Error(), "connection reset") {
-			log.Printf("Error streaming to MMS client: %v\nFFmpeg output: %s", err, stderr.String())
-		} else {
-			log.Printf("MMS client disconnected from %s stream", channel.Name)
+	log.Printf("Starting FFmpeg transcode to temporary file")
+	if err := cmd.Start(); err != nil {
+		log.Printf("Error starting FFmpeg: %v", err)
+		return
+	}
+
+	// Start a goroutine to wait for FFmpeg to produce some output
+	outputReady := make(chan bool)
+	go func() {
+		// Check every 200ms if the file exists and has some content
+		for i := 0; i < 50; i++ { // Try for 10 seconds (50 * 200ms)
+			time.Sleep(200 * time.Millisecond)
+			info, err := os.Stat(tmpName)
+			if err == nil && info.Size() > 0 {
+				log.Printf("FFmpeg output file created with size: %d bytes", info.Size())
+				outputReady <- true
+				return
+			}
+		}
+		// If we get here, FFmpeg failed to create/write to the output file
+		log.Printf("FFmpeg failed to create output within timeout period")
+		outputReady <- false
+	}()
+
+	// Wait for output to be ready or timeout
+	var fileReady bool
+	select {
+	case fileReady = <-outputReady:
+		if !fileReady {
+			log.Printf("Timed out waiting for FFmpeg to produce output")
+			cmd.Process.Kill()
+			return
+		}
+	case <-time.After(15 * time.Second): // Longer timeout
+		log.Printf("Timed out waiting for FFmpeg output channel")
+		cmd.Process.Kill()
+		return
+	}
+
+	// If we get here, the file was created successfully
+	// Let's try a simpler approach: terminate FFmpeg and then read the complete file
+	log.Printf("Output file created, terminating FFmpeg process")
+	cmd.Process.Kill()
+	cmd.Wait()
+
+	// Check if the file actually has content
+	fileInfo, err := os.Stat(tmpName)
+	if err != nil || fileInfo.Size() == 0 {
+		log.Printf("Output file is empty or cannot be accessed: %v", err)
+		return
+	}
+	log.Printf("Output file size: %d bytes", fileInfo.Size())
+
+	// Open the file and stream it to the client
+	file, err := os.Open(tmpName)
+	if err != nil {
+		log.Printf("Error opening temporary file: %v", err)
+		return
+	}
+	defer file.Close()
+	defer os.Remove(tmpName)
+
+	log.Printf("Starting to stream file to client")
+	buffer := make([]byte, 8192)
+	for {
+		n, err := file.Read(buffer)
+		if err == io.EOF {
+			log.Printf("End of file reached")
+			break
+		}
+		if err != nil {
+			log.Printf("Error reading from temporary file: %v", err)
+			break
+		}
+
+		_, err = conn.Write(buffer[:n])
+		if err != nil {
+			log.Printf("Error writing to MMS connection: %v", err)
+			break
 		}
 	}
 
