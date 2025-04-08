@@ -25,51 +25,26 @@ const (
 	MMSProtocol        = "mms://" // MMS protocol prefix
 	MMSPort            = 1755     // Standard MMS port
 
-	// MMS protocol command types - expanded list based on MS-MMS protocol
-	MMS_CONNECT         = 0x00000001
-	MMS_CONNECT_RESP    = 0x00000002
-	MMS_PROTOCOL_SELECT = 0x00000003
-	MMS_START_PLAY      = 0x00000007
-	MMS_START_PLAY_RESP = 0x00000008
-	MMS_DATA_PACKET     = 0x00000020
-	MMS_END_OF_STREAM   = 0x00000021
+	// Standard MMS protocol message IDs from MS-MMS specification
+	MMS_LinkViewerToMacConnect            = 0x00000001
+	MMS_LinkMacToViewerReportConnectedEX  = 0x00000002
+	MMS_LinkViewerToMacOpenFile           = 0x00000005
+	MMS_LinkMacToViewerReportOpenFile     = 0x00000006
+	MMS_LinkViewerToMacReadBlock          = 0x00000011
+	MMS_LinkViewerToMacStartPlaying       = 0x00000007
+	MMS_LinkMacToViewerReportStartPlaying = 0x00000008
+	MMS_LinkViewerToMacStopPlaying        = 0x00000009
+	MMS_LinkMacToViewerReportStopPlaying  = 0x0000000A
+	MMS_LinkMacToViewerDataPacket         = 0x00000020
+	MMS_LinkMacToViewerEndOfStream        = 0x00000021
 
-	// Extended MMS commands
+	// Additional MMS commands for specific clients
 	MMS_HEADER_START = 0xB0000000
 	MMS_HEADER_END   = 0xB1000000
 
 	// Common received commands from WMP
-	MMS_COMMAND_0FB00000 = 0x0FB00000
 	MMS_COMMAND_0F000000 = 0x0F000000
 	MMS_COMMAND_1F000000 = 0x1F000000
-	MMS_COMMAND_B0000000 = 0xB0000000
-	MMS_COMMAND_B1000000 = 0xB1000000
-
-	// Additional commands seen in WMPMac logs
-	MMS_COMMAND_3F000001 = 0x3F000001
-	MMS_COMMAND_4B000001 = 0x4B000001
-	MMS_COMMAND_B3000001 = 0xB3000001
-	MMS_COMMAND_34000001 = 0x34000001
-	MMS_COMMAND_23000001 = 0x23000001
-	MMS_COMMAND_B2000001 = 0xB2000001
-	MMS_COMMAND_D4000001 = 0xD4000001
-	MMS_COMMAND_84000001 = 0x84000001
-	MMS_COMMAND_AA000001 = 0xAA000001
-	MMS_COMMAND_7F000001 = 0x7F000001
-	MMS_COMMAND_7D000001 = 0x7D000001
-	MMS_COMMAND_5C000001 = 0x5C000001
-	MMS_COMMAND_53000001 = 0x53000001
-	MMS_COMMAND_73000001 = 0x73000001
-	MMS_COMMAND_F0000001 = 0xF0000001
-
-	// Standard MMS protocol message IDs from MS-MMS specification
-	MMS_LinkViewerToMacConnect            = 0x00040001
-	MMS_LinkMacToViewerReportConnectedEX  = 0x00040002
-	MMS_LinkViewerToMacOpenFile           = 0x00040027
-	MMS_LinkMacToViewerReportOpenFile     = 0x00040006
-	MMS_LinkViewerToMacReadBlock          = 0x00040029
-	MMS_LinkViewerToMacStartPlaying       = 0x00040025
-	MMS_LinkMacToViewerReportStartPlaying = 0x00040009
 
 	// MMS protocol message types
 	MMS_MESSAGE_TYPE_DATA    = 0x00000000
@@ -77,6 +52,17 @@ const (
 	MMS_MESSAGE_TYPE_ACK     = 0x00000002
 	MMS_MESSAGE_TYPE_REQUEST = 0x00000003
 	MMS_MESSAGE_TYPE_REPORT  = 0x00000004
+)
+
+// Add more constants for the MMS protocol
+const (
+	// Additional compatibility constants
+	MMS_CONNECT         = MMS_LinkViewerToMacConnect           // 0x00000001
+	MMS_CONNECT_RESP    = MMS_LinkMacToViewerReportConnectedEX // 0x00000002
+	MMS_PROTOCOL_SELECT = 0x00000003                           // Protocol selection command
+	MMS_START_PLAY      = MMS_LinkViewerToMacStartPlaying      // 0x00000007
+	MMS_DATA_PACKET     = MMS_LinkMacToViewerDataPacket        // 0x00000020
+	MMS_END_OF_STREAM   = MMS_LinkMacToViewerEndOfStream       // 0x00000021
 )
 
 // MMSHeader represents an MMS protocol header
@@ -102,6 +88,13 @@ type Channel struct {
 type TemplateData struct {
 	Channels []Channel
 	Time     string
+}
+
+// MMSClientState tracks the state of an MMS client connection through the protocol stages
+type MMSClientState struct {
+	Channel     *Channel
+	SeqNum      uint32
+	PlayingFile bool
 }
 
 var (
@@ -192,44 +185,169 @@ func handleMMSConnection(conn net.Conn) {
 	remoteAddr := conn.RemoteAddr().String()
 	log.Printf("New MMS connection from %s", remoteAddr)
 
-	// Buffer for reading MMS headers
-	buf := make([]byte, 4096)
-
-	// Read the initial MMS command
-	n, err := conn.Read(buf)
-	if err != nil {
-		log.Printf("Error reading from connection %s: %v", remoteAddr, err)
-		return
+	// Initialize client state
+	clientState := &MMSClientState{
+		SeqNum:      0,
+		PlayingFile: false,
 	}
 
-	// Dump the raw received data in hex for debugging
-	log.Printf("Received %d bytes from %s", n, remoteAddr)
-	log.Printf("Raw data: %s", hex.Dump(buf[:n]))
+	// Main protocol loop
+	for {
+		// Buffer for reading MMS headers
+		buf := make([]byte, 4096)
 
-	// Check if we have enough data for an MMS header
-	if n < 40 {
-		log.Printf("Received too short message from %s (%d bytes)", remoteAddr, n)
-		return
+		// Read the MMS command
+		n, err := conn.Read(buf)
+		if err != nil {
+			if err != io.EOF {
+				log.Printf("Error reading from connection %s: %v", remoteAddr, err)
+			} else {
+				log.Printf("Client %s disconnected", remoteAddr)
+			}
+			return
+		}
+
+		// Check if we received any data
+		if n == 0 {
+			log.Printf("Received empty message from %s", remoteAddr)
+			continue
+		}
+
+		// Dump the raw received data in hex for debugging (small samples only)
+		if n < 100 {
+			log.Printf("Received %d bytes from %s", n, remoteAddr)
+			log.Printf("Raw data: %s", hex.Dump(buf[:n]))
+		} else {
+			log.Printf("Received %d bytes from %s (too large to dump)", n, remoteAddr)
+		}
+
+		// Check if we have enough data for an MMS header
+		if n < 40 {
+			log.Printf("Received too short message from %s (%d bytes)", remoteAddr, n)
+			continue
+		}
+
+		var header MMSHeader
+		headerBuf := bytes.NewBuffer(buf[:40])
+		if err := binary.Read(headerBuf, binary.LittleEndian, &header); err != nil {
+			log.Printf("Error parsing MMS header from %s: %v", remoteAddr, err)
+			continue
+		}
+
+		log.Printf("MMS command received from %s: CommandID=0x%08X, SeqNum=%d",
+			remoteAddr, header.CommandID, header.SequenceNum)
+
+		// Update the client sequence number
+		clientState.SeqNum = header.SequenceNum
+
+		// Extract client info for better logging (only on the first command)
+		if clientState.SeqNum == 0 {
+			clientInfo := extractClientInfo(buf[40:n])
+			if clientInfo != "" {
+				log.Printf("Client info: %s", clientInfo)
+			}
+		}
+
+		// Handle the command based on the MMS protocol state machine
+		switch header.CommandID {
+		case MMS_LinkViewerToMacConnect:
+			// Client connection request - send connection response
+			sendMMSConnectResponse(conn, header.SequenceNum)
+
+		case MMS_LinkViewerToMacOpenFile:
+			// Client requesting to open a file
+			log.Printf("Client requesting to open file")
+
+			// Parse the file path from the data
+			path := extractURLFromData(buf[40:n])
+			log.Printf("Requested file path: %s", path)
+
+			// Find channel by URL/path
+			channel := findChannelFromPath(path)
+			if channel != nil {
+				clientState.Channel = channel
+				log.Printf("Found channel: %s", channel.Name)
+
+				// Send file opened response
+				sendMMSFileOpenedResponse(conn, header.SequenceNum)
+			} else {
+				log.Printf("No matching channel found for path: %s", path)
+				// Default to first channel if available
+				if len(channels) > 0 {
+					ch := channels[0]
+					clientState.Channel = &ch
+					sendMMSFileOpenedResponse(conn, header.SequenceNum)
+				} else {
+					// No channels available
+					return
+				}
+			}
+
+		case MMS_LinkViewerToMacReadBlock:
+			// Client requesting file header
+			log.Printf("Client requesting to read file header block")
+			// This usually comes after opening a file
+			if clientState.Channel != nil && !clientState.PlayingFile {
+				// Prepare the ASF header and send it
+				sendPreloadedASFHeader(conn, clientState)
+			}
+
+		case MMS_LinkViewerToMacStartPlaying:
+			// Client requesting to start playback
+			log.Printf("Client requesting to start playback")
+
+			if clientState.Channel != nil {
+				// Send start playing response
+				sendMMSStartPlayingResponse(conn, header.SequenceNum)
+
+				// Start streaming the content
+				clientState.PlayingFile = true
+				go streamToMMSClient(conn, clientState.Channel)
+				// Note: The goroutine will continue streaming until the connection closes
+				return
+			}
+
+		case MMS_LinkViewerToMacStopPlaying:
+			// Client requesting to stop playback
+			log.Printf("Client requesting to stop playback")
+			sendMMSStopPlayingResponse(conn, header.SequenceNum)
+			clientState.PlayingFile = false
+
+		default:
+			// Handle other commands or malformed packets
+			log.Printf("Unhandled command from %s: 0x%08X", remoteAddr, header.CommandID)
+
+			// If no channel is selected yet, try to extract a channel from the data
+			if clientState.Channel == nil && n > 40 {
+				path := extractURLFromData(buf[40:n])
+				if path != "" {
+					channel := findChannelFromPath(path)
+					if channel != nil {
+						clientState.Channel = channel
+						log.Printf("Found channel from data: %s", channel.Name)
+
+						// For compatibility with older clients, proceed directly to streaming
+						sendMMSConnectResponse(conn, header.SequenceNum)
+						clientState.PlayingFile = true
+						go streamToMMSClient(conn, clientState.Channel)
+						return
+					}
+				}
+
+				// If no channel found, use the first one (if available)
+				if clientState.Channel == nil && len(channels) > 0 {
+					ch := channels[0]
+					clientState.Channel = &ch
+					log.Printf("Using default channel: %s", ch.Name)
+
+					sendMMSConnectResponse(conn, header.SequenceNum)
+					clientState.PlayingFile = true
+					go streamToMMSClient(conn, clientState.Channel)
+					return
+				}
+			}
+		}
 	}
-
-	var header MMSHeader
-	headerBuf := bytes.NewBuffer(buf[:40])
-	err = binary.Read(headerBuf, binary.LittleEndian, &header)
-	if err != nil {
-		log.Printf("Error parsing MMS header from %s: %v", remoteAddr, err)
-		return
-	}
-
-	log.Printf("MMS command received from %s: CommandID=0x%08X", remoteAddr, header.CommandID)
-
-	// Extract client info for better logging
-	clientInfo := extractClientInfo(buf[40:n])
-	if clientInfo != "" {
-		log.Printf("Client info: %s", clientInfo)
-	}
-
-	// This is now a WMPMac connection - proceed with standard MMS protocol
-	handleWMPMacConnection(conn, header, buf[40:n])
 }
 
 // Extract client information (User-Agent) from the connection data
@@ -252,37 +370,50 @@ func extractClientInfo(data []byte) string {
 	return info.String()
 }
 
+// Extract a URL or file path from MMS data
+func extractURLFromData(data []byte) string {
+	// Extract printable ASCII characters
+	var url strings.Builder
+	for _, b := range data {
+		if b >= 32 && b <= 126 {
+			url.WriteByte(b)
+		}
+	}
+
+	return url.String()
+}
+
+// Find a channel by path or URL
+func findChannelFromPath(path string) *Channel {
+	for _, ch := range channels {
+		// Check if the path contains the channel slug
+		if strings.Contains(strings.ToLower(path), ch.Slug) {
+			return &ch
+		}
+	}
+	return nil
+}
+
 // Handle a WMPMac client connection following MS-MMS protocol
 func handleWMPMacConnection(conn net.Conn, header MMSHeader, data []byte) {
-	// In MS-MMS protocol, a client connection typically follows these steps:
-	// 1. Client sends LinkViewerToMacConnect
-	// 2. Server responds with LinkMacToViewerReportConnectedEX
-	// 3. Client sends LinkViewerToMacOpenFile
-	// 4. Server responds with LinkMacToViewerReportOpenFile
-	// 5. Client may send LinkViewerToMacReadBlock for headers
-	// 6. Client sends LinkViewerToMacStartPlaying
-	// 7. Server responds with LinkMacToViewerReportStartPlaying
-	// 8. Server streams data packets
-
 	remoteAddr := conn.RemoteAddr().String()
 	cmdID := header.CommandID
 
 	// Log the command ID type for better diagnostics
 	var cmdType string
-	switch cmdID {
-	case MMS_COMMAND_7D000001, MMS_COMMAND_5C000001, MMS_COMMAND_7F000001, MMS_COMMAND_AA000001,
-		MMS_COMMAND_B3000001, MMS_COMMAND_34000001, MMS_COMMAND_23000001, MMS_COMMAND_B2000001,
-		MMS_COMMAND_D4000001, MMS_COMMAND_84000001, MMS_COMMAND_3F000001, MMS_COMMAND_4B000001,
-		MMS_COMMAND_53000001, MMS_COMMAND_73000001, MMS_COMMAND_F0000001:
-		cmdType = "WMPMac Initial Connect"
-	case MMS_CONNECT, MMS_COMMAND_0FB00000, MMS_COMMAND_0F000000:
-		cmdType = "Standard Connect"
-	case MMS_START_PLAY, MMS_COMMAND_1F000000:
+	if cmdID == MMS_LinkViewerToMacConnect {
+		cmdType = "Connect Request"
+	} else if cmdID == MMS_LinkViewerToMacStartPlaying {
 		cmdType = "Start Play Request"
-	default:
-		cmdType = "Unknown Command Type"
+	} else if cmdID == MMS_COMMAND_0F000000 {
+		cmdType = "Standard Connect"
+	} else if cmdID == MMS_COMMAND_1F000000 {
+		cmdType = "Start Play Request"
+	} else {
+		cmdType = fmt.Sprintf("Unknown Command Type (0x%08X)", cmdID)
 	}
-	log.Printf("Processing %s command (ID: 0x%08X) from %s", cmdType, cmdID, remoteAddr)
+
+	log.Printf("Processing %s command from %s", cmdType, remoteAddr)
 
 	// We've received a connection request - respond with connect response
 	sendMMSConnectResponse(conn, header.SequenceNum)
@@ -379,31 +510,28 @@ func streamToMMSClient(conn net.Conn, channel *Channel) {
 	tmpName := filepath.Join(tempDir, fmt.Sprintf("mms-stream-%s-%d.asf", channel.Slug, time.Now().UnixNano()))
 	log.Printf("Using temporary file: %s", tmpName)
 
-	// Send initial MMS headers to client
-	sendMMSProtocolSelection(conn)
-
 	// First, transcode to the temporary ASF file with improved options for WMP compatibility
 	cmd := exec.Command("ffmpeg",
 		"-v", "info", // More verbose logging to diagnose issues
-		"-ignore_unknown", "1",
+		"-nostdin", // Don't expect stdin input to avoid hanging
 		"-i", channel.URL,
-		"-sn", // Skip subtitles
-		"-dn", // Skip data streams
-		"-max_muxing_queue_size", "1024",
+		"-sn",                            // Skip subtitles
+		"-dn",                            // Skip data streams
+		"-max_muxing_queue_size", "1024", // Handle larger input buffers
 		"-map", "0:v:0?", // Map only first video stream if available
 		"-map", "0:a:0?", // Map only first audio stream if available
-		"-c:v", "wmv1",
-		"-b:v", "300k",
-		"-r", "25",
-		"-g", "250",
-		"-bf", "0",
-		"-c:a", "wmav1",
-		"-b:a", "64k",
-		"-ar", "44100",
-		"-ac", "2",
-		"-vf", "scale=320:240",
+		"-c:v", "wmv1", // Use WMV1 codec for better WMP7 compatibility
+		"-b:v", "300k", // Reasonable video bitrate
+		"-r", "25", // 25 fps
+		"-g", "250", // Keyframe every 10 seconds
+		"-bf", "0", // No B-frames for better compatibility
+		"-c:a", "wmav1", // WMA version 1 for better compatibility
+		"-b:a", "64k", // Audio bitrate
+		"-ar", "44100", // Standard audio rate
+		"-ac", "2", // Stereo audio
+		"-vf", "scale=320:240", // Smaller resolution for better streaming
 		"-f", "asf", // Format for Windows Media
-		"-asf_stream_properties", "parse_all=true",
+		"-asf_stream_properties", "parse_all=true", // Better ASF compatibility
 		"-y",    // Overwrite output file
 		tmpName) // Output file
 
@@ -464,9 +592,6 @@ func streamToMMSClient(conn net.Conn, channel *Channel) {
 	}
 	log.Printf("Output file size: %d bytes", fileInfo.Size())
 
-	// Send MMS file header
-	sendMMSHeaderStart(conn)
-
 	// Open the file and stream it to the client
 	file, err := os.Open(tmpName)
 	if err != nil {
@@ -476,6 +601,12 @@ func streamToMMSClient(conn net.Conn, channel *Channel) {
 	defer file.Close()
 	defer os.Remove(tmpName)
 
+	// First, send a protocol selection message (if not already sent)
+	sendMMSProtocolSelection(conn)
+
+	// Send MMS file header start notification
+	sendMMSHeaderStart(conn)
+
 	// Send ASF header packets first
 	headerBuf := make([]byte, 8192) // Larger buffer for ASF header
 	n, err := file.Read(headerBuf)
@@ -484,10 +615,39 @@ func streamToMMSClient(conn net.Conn, channel *Channel) {
 		return
 	}
 
-	// Send the ASF header as an MMS_DATA_PACKET
-	sendMMSDataPacket(conn, headerBuf[:n], 0)
+	// Send the ASF header as an MMS_DATA_PACKET using the LinkMacToViewerDataPacket command ID
+	header := MMSHeader{
+		CommandID:   MMS_LinkMacToViewerDataPacket, // Using standard MS-MMS command ID
+		Reserved1:   0,
+		Reserved2:   0,
+		MessageLen:  uint32(n + 40), // Add header size
+		SequenceNum: 0,              // Header is always packet 0
+		TimeoutVal:  0,
+		Reserved3:   0,
+		Reserved4:   0,
+		Reserved5:   0,
+		MessageLen2: uint32(n + 40),
+	}
 
-	// Send MMS header end
+	// Send header with proper MS-MMS data packet format
+	packetHeaderBuf := new(bytes.Buffer)
+	if err := binary.Write(packetHeaderBuf, binary.LittleEndian, header); err != nil {
+		log.Printf("Error creating MMS data packet header: %v", err)
+		return
+	}
+
+	if _, err := conn.Write(packetHeaderBuf.Bytes()); err != nil {
+		log.Printf("Error sending MMS data packet header: %v", err)
+		return
+	}
+
+	// Send actual ASF header data
+	if _, err := conn.Write(headerBuf[:n]); err != nil {
+		log.Printf("Error sending ASF header data: %v", err)
+		return
+	}
+
+	// Signal header end
 	sendMMSHeaderEnd(conn)
 
 	// Now send the actual data packets
@@ -507,16 +667,69 @@ func streamToMMSClient(conn net.Conn, channel *Channel) {
 			break
 		}
 
-		// Send as MMS data packet
-		sendMMSDataPacket(conn, buffer[:n], packetNumber)
+		// Send as MMS data packet using proper MS-MMS command ID
+		header = MMSHeader{
+			CommandID:   MMS_LinkMacToViewerDataPacket, // Standard MS-MMS command ID
+			Reserved1:   0,
+			Reserved2:   0,
+			MessageLen:  uint32(n + 40), // Add header size
+			SequenceNum: packetNumber,   // Increment for each packet
+			TimeoutVal:  0,
+			Reserved3:   0,
+			Reserved4:   0,
+			Reserved5:   0,
+			MessageLen2: uint32(n + 40),
+		}
+
+		// Send each packet with proper header
+		dataBuf := new(bytes.Buffer)
+		if err := binary.Write(dataBuf, binary.LittleEndian, header); err != nil {
+			log.Printf("Error creating MMS data packet header: %v", err)
+			break
+		}
+
+		if _, err := conn.Write(dataBuf.Bytes()); err != nil {
+			log.Printf("Error sending MMS data packet header: %v", err)
+			break
+		}
+
+		// Send the actual data
+		if _, err := conn.Write(buffer[:n]); err != nil {
+			log.Printf("Error sending MMS data packet data: %v", err)
+			break
+		}
+
 		packetNumber++
 
 		// Small delay between packets to prevent overwhelming the client
+		// Adjust this value based on network conditions and client capabilities
 		time.Sleep(20 * time.Millisecond)
 	}
 
-	// Send end of stream marker
-	sendMMSEndOfStream(conn)
+	// Send end of stream marker with proper MS-MMS command ID
+	header = MMSHeader{
+		CommandID:   MMS_LinkMacToViewerEndOfStream, // Standard MS-MMS command ID
+		Reserved1:   0,
+		Reserved2:   0,
+		MessageLen:  40,
+		SequenceNum: packetNumber, // Use next sequence number
+		TimeoutVal:  0,
+		Reserved3:   0,
+		Reserved4:   0,
+		Reserved5:   0,
+		MessageLen2: 40,
+	}
+
+	endBuf := new(bytes.Buffer)
+	if err := binary.Write(endBuf, binary.LittleEndian, header); err != nil {
+		log.Printf("Error creating MMS end of stream header: %v", err)
+		return
+	}
+
+	if _, err := conn.Write(endBuf.Bytes()); err != nil {
+		log.Printf("Error sending MMS end of stream header: %v", err)
+		return
+	}
 
 	log.Printf("MMS stream ended for %s to %s", channel.Name, conn.RemoteAddr())
 }
@@ -667,6 +880,117 @@ func sendMMSEndOfStream(conn net.Conn) {
 	}
 
 	log.Printf("Sent MMS end of stream header")
+}
+
+// Send MMS file opened response
+func sendMMSFileOpenedResponse(conn net.Conn, seqNum uint32) {
+	response := MMSHeader{
+		CommandID:   MMS_LinkMacToViewerReportOpenFile,
+		Reserved1:   0,
+		Reserved2:   0,
+		MessageLen:  40,
+		SequenceNum: seqNum + 1,
+		TimeoutVal:  0,
+		Reserved3:   0,
+		Reserved4:   0,
+		Reserved5:   0,
+		MessageLen2: 40,
+	}
+
+	respBuf := new(bytes.Buffer)
+	if err := binary.Write(respBuf, binary.LittleEndian, response); err != nil {
+		log.Printf("Error creating MMS file opened response: %v", err)
+		return
+	}
+
+	if _, err := conn.Write(respBuf.Bytes()); err != nil {
+		log.Printf("Error sending MMS file opened response: %v", err)
+		return
+	}
+
+	log.Printf("Sent MMS file opened response (0x%08X)", MMS_LinkMacToViewerReportOpenFile)
+}
+
+// Send MMS start playing response
+func sendMMSStartPlayingResponse(conn net.Conn, seqNum uint32) {
+	response := MMSHeader{
+		CommandID:   MMS_LinkMacToViewerReportStartPlaying,
+		Reserved1:   0,
+		Reserved2:   0,
+		MessageLen:  40,
+		SequenceNum: seqNum + 1,
+		TimeoutVal:  0,
+		Reserved3:   0,
+		Reserved4:   0,
+		Reserved5:   0,
+		MessageLen2: 40,
+	}
+
+	respBuf := new(bytes.Buffer)
+	if err := binary.Write(respBuf, binary.LittleEndian, response); err != nil {
+		log.Printf("Error creating MMS start playing response: %v", err)
+		return
+	}
+
+	if _, err := conn.Write(respBuf.Bytes()); err != nil {
+		log.Printf("Error sending MMS start playing response: %v", err)
+		return
+	}
+
+	log.Printf("Sent MMS start playing response (0x%08X)", MMS_LinkMacToViewerReportStartPlaying)
+}
+
+// Send MMS stop playing response
+func sendMMSStopPlayingResponse(conn net.Conn, seqNum uint32) {
+	response := MMSHeader{
+		CommandID:   MMS_LinkMacToViewerReportStopPlaying,
+		Reserved1:   0,
+		Reserved2:   0,
+		MessageLen:  40,
+		SequenceNum: seqNum + 1,
+		TimeoutVal:  0,
+		Reserved3:   0,
+		Reserved4:   0,
+		Reserved5:   0,
+		MessageLen2: 40,
+	}
+
+	respBuf := new(bytes.Buffer)
+	if err := binary.Write(respBuf, binary.LittleEndian, response); err != nil {
+		log.Printf("Error creating MMS stop playing response: %v", err)
+		return
+	}
+
+	if _, err := conn.Write(respBuf.Bytes()); err != nil {
+		log.Printf("Error sending MMS stop playing response: %v", err)
+		return
+	}
+
+	log.Printf("Sent MMS stop playing response (0x%08X)", MMS_LinkMacToViewerReportStopPlaying)
+}
+
+// Send a preloaded ASF header packet to the client
+func sendPreloadedASFHeader(conn net.Conn, clientState *MMSClientState) {
+	// In a real implementation, we might cache ASF headers
+	// For now, we'll generate a minimal ASF header placeholder
+	log.Printf("Sending ASF header for channel: %s", clientState.Channel.Name)
+
+	// Send header start notification
+	sendMMSHeaderStart(conn)
+
+	// Typically, we'd extract this from the actual media file
+	// This is just a placeholder - real implementation would get proper ASF headers
+	asf_header_placeholder := []byte{
+		0x30, 0x26, 0xB2, 0x75, 0x8E, 0x66, 0xCF, 0x11,
+		0xA6, 0xD9, 0x00, 0xAA, 0x00, 0x62, 0xCE, 0x6C,
+		// ... more ASF header bytes would go here
+	}
+
+	// Send the ASF header as data packet
+	sendMMSDataPacket(conn, asf_header_placeholder, 0)
+
+	// Send header end notification
+	sendMMSHeaderEnd(conn)
 }
 
 func findChannelBySlug(slug string) (*Channel, bool) {
