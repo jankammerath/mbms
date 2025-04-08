@@ -16,7 +16,10 @@ import (
 	"time"
 )
 
-const VideoFileExtension = ".wmv"
+const (
+	VideoFileExtension = ".asx"
+	MMSProtocol        = "mms://" // MMS protocol prefix
+)
 
 type Channel struct {
 	Name string
@@ -81,13 +84,14 @@ func captureScreenshots() {
 	}
 }
 
-func writeASX(w http.ResponseWriter, channel Channel, baseURL string) {
-	fmt.Fprintf(w, `<?xml version="1.0" encoding="UTF-8"?>
-<asx version="3.0">
-	<entry>
-		<ref href="%s/stream/%s%s"/>
-	</entry>
-</asx>`, baseURL, channel.Slug, VideoFileExtension)
+func writeASX(w http.ResponseWriter, channel Channel, host string) {
+	// Create a Windows Media Player compatible ASX file with MMS protocol
+	fmt.Fprintf(w, `<ASX VERSION="3.0">
+<ENTRY>
+<TITLE>%s</TITLE>
+<REF HREF="%s%s/stream/%s.wmv"/>
+</ENTRY>
+</ASX>`, channel.Name, MMSProtocol, host, channel.Slug)
 }
 
 func findChannelBySlug(slug string) (*Channel, bool) {
@@ -101,7 +105,7 @@ func findChannelBySlug(slug string) (*Channel, bool) {
 
 func streamHandler(w http.ResponseWriter, r *http.Request) {
 	slug := strings.TrimPrefix(r.URL.Path, "/stream/")
-	slug = strings.TrimSuffix(slug, VideoFileExtension)
+	slug = strings.TrimSuffix(slug, ".wmv")
 	channel, found := findChannelBySlug(slug)
 	if !found {
 		http.NotFound(w, r)
@@ -110,20 +114,76 @@ func streamHandler(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("Stream request from %s for channel %s (%s)", r.RemoteAddr, channel.Name, r.URL.Path)
 
+	// Log the entire request data for debugging
+	log.Printf("--- Begin Request Details ---")
+	log.Printf("Method: %s", r.Method)
+	log.Printf("URL: %s", r.URL.String())
+	log.Printf("Protocol: %s", r.Proto)
+	log.Printf("Host: %s", r.Host)
+	log.Printf("Remote Address: %s", r.RemoteAddr)
+
+	// Log all request headers
+	log.Println("Headers:")
+	for name, values := range r.Header {
+		for _, value := range values {
+			log.Printf("  %s: %s", name, value)
+		}
+	}
+
+	// Log request cookies
+	if len(r.Cookies()) > 0 {
+		log.Println("Cookies:")
+		for _, cookie := range r.Cookies() {
+			log.Printf("  %s: %s", cookie.Name, cookie.Value)
+		}
+	}
+
+	// Log any URL parameters
+	if r.URL.RawQuery != "" {
+		log.Printf("Query Parameters: %s", r.URL.RawQuery)
+	}
+
+	// Log form data if present
+	r.ParseForm()
+	if len(r.Form) > 0 {
+		log.Println("Form Data:")
+		for key, values := range r.Form {
+			for _, value := range values {
+				log.Printf("  %s: %s", key, value)
+			}
+		}
+	}
+	log.Printf("--- End Request Details ---")
+
+	// Set headers for Windows Media Player compatibility with MMS protocol
 	w.Header().Set("Content-Type", "video/x-ms-wmv")
-	w.Header().Set("Connection", "close")
+	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Accept-Ranges", "bytes")
 	w.(http.Flusher).Flush()
 
 	log.Printf("Starting FFmpeg transcoding for channel %s", channel.Name)
-	cmd := exec.Command("ffmpeg", "-v", "verbose", "-re", "-i", channel.URL,
+
+	// Use FFmpeg with settings optimized for Windows Media Player 7 with MMS protocol
+	cmd := exec.Command("ffmpeg",
+		"-i", channel.URL,
 		"-c:v", "msmpeg4v3",
 		"-b:v", "300k",
+		"-r", "25", // Reduce framerate to 25fps
+		"-g", "250", // Keyframe every 10 seconds at 25fps
+		"-bf", "0", // No B-frames for better compatibility
 		"-c:a", "wmav2",
 		"-b:a", "128k",
+		"-ar", "44100", // 44.1kHz audio sample rate
+		"-ac", "2", // Stereo audio
 		"-vf", "scale=640:360",
-		"-f", "asf",
+		"-f", "asf", // ASF container for WMV/WMA
+		"-packetsize", "3200",
+		"-map", "0:v:0", // Map the first video stream
+		"-map", "0:a:0", // Map the first audio stream
+		"-sn",                        // Skip subtitles
+		"-max_interleave_delta", "0", // Reduce interleave delta for more resilience
+		"-flush_packets", "1", // Flush packets immediately
+		"-muxdelay", "0", // No mux delay
 		"-")
 
 	var stderr bytes.Buffer
@@ -131,10 +191,15 @@ func streamHandler(w http.ResponseWriter, r *http.Request) {
 	cmd.Stdout = w
 
 	if err := cmd.Run(); err != nil {
-		log.Printf("Transcoding error for %s: %v\nFFmpeg output:\n%s", channel.Name, err, stderr.String())
-		http.Error(w, "Transcoding failed", http.StatusInternalServerError)
+		// Ignore broken pipe errors (client disconnected) to avoid flooding logs
+		if !strings.Contains(err.Error(), "broken pipe") && !strings.Contains(err.Error(), "exit status 224") {
+			log.Printf("Transcoding error for %s: %v\nFFmpeg output:\n%s", channel.Name, err, stderr.String())
+		} else {
+			log.Printf("Client disconnected from %s stream", channel.Name)
+		}
 		return
 	}
+
 	log.Printf("Stream ended for channel %s", channel.Name)
 }
 
@@ -148,7 +213,7 @@ func asxHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "video/x-ms-asf")
-	writeASX(w, *channel, "http://"+r.Host)
+	writeASX(w, *channel, r.Host)
 }
 
 func checkFFmpeg() error {
