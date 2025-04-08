@@ -56,6 +56,8 @@ const (
 	MMS_COMMAND_84000001 = 0x84000001
 	MMS_COMMAND_AA000001 = 0xAA000001
 	MMS_COMMAND_7F000001 = 0x7F000001
+	MMS_COMMAND_7D000001 = 0x7D000001
+	MMS_COMMAND_5C000001 = 0x5C000001
 
 	// Standard MMS protocol message IDs from MS-MMS specification
 	MMS_LinkViewerToMacConnect            = 0x00040001
@@ -260,6 +262,23 @@ func handleWMPMacConnection(conn net.Conn, header MMSHeader, data []byte) {
 	// 8. Server streams data packets
 
 	remoteAddr := conn.RemoteAddr().String()
+	cmdID := header.CommandID
+
+	// Log the command ID type for better diagnostics
+	var cmdType string
+	switch cmdID {
+	case MMS_COMMAND_7D000001, MMS_COMMAND_5C000001, MMS_COMMAND_7F000001, MMS_COMMAND_AA000001,
+		MMS_COMMAND_B3000001, MMS_COMMAND_34000001, MMS_COMMAND_23000001, MMS_COMMAND_B2000001,
+		MMS_COMMAND_D4000001, MMS_COMMAND_84000001, MMS_COMMAND_3F000001, MMS_COMMAND_4B000001:
+		cmdType = "WMPMac Initial Connect"
+	case MMS_CONNECT, MMS_COMMAND_0FB00000, MMS_COMMAND_0F000000:
+		cmdType = "Standard Connect"
+	case MMS_START_PLAY, MMS_COMMAND_1F000000:
+		cmdType = "Start Play Request"
+	default:
+		cmdType = "Unknown Command Type"
+	}
+	log.Printf("Processing %s command (ID: 0x%08X) from %s", cmdType, cmdID, remoteAddr)
 
 	// We've received a connection request - respond with connect response
 	sendMMSConnectResponse(conn, header.SequenceNum)
@@ -644,22 +663,6 @@ func sendMMSEndOfStream(conn net.Conn) {
 	}
 
 	log.Printf("Sent MMS end of stream header")
-}
-
-func writeASX(w http.ResponseWriter, channel Channel, host string) {
-	// Extract host without port if necessary
-	hostOnly := host
-	if h, _, err := net.SplitHostPort(host); err == nil {
-		hostOnly = h
-	}
-
-	// Create a Windows Media Player compatible ASX file with MMS protocol
-	fmt.Fprintf(w, `<ASX VERSION="3.0">
-<ENTRY>
-<TITLE>%s</TITLE>
-<REF HREF="%s%s:%d/%s.wmv"/>
-</ENTRY>
-</ASX>`, channel.Name, MMSProtocol, hostOnly, MMSPort, channel.Slug)
 }
 
 func findChannelBySlug(slug string) (*Channel, bool) {
