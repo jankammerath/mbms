@@ -60,7 +60,7 @@ func captureScreenshots() {
 		for i, channel := range channels {
 			outputPath := filepath.Join("screenshots", fmt.Sprintf("channel_%d.jpg", i))
 			cmd := exec.Command("ffmpeg", "-y", "-i", channel.URL,
-				"-vframes", "1", "-q:v", "2", outputPath)
+				"-vframes", "1", "-s", "320x240", "-q:v", "2", outputPath)
 			if err := cmd.Run(); err != nil {
 				log.Printf("Error capturing screenshot for %s: %v", channel.Name, err)
 				continue
@@ -87,6 +87,8 @@ func transcodeHandler(w http.ResponseWriter, r *http.Request) {
 	ch := channels[idx]
 	cmd := exec.Command("ffmpeg", "-i", ch.URL,
 		"-c:v", "wmv2", "-c:a", "wmav2",
+		"-s", "320x240", "-b:v", "150k", "-b:a", "32k",
+		"-ar", "22050", "-ac", "2",
 		"-f", "asf", "-")
 
 	cmd.Stdout = w
