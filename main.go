@@ -78,17 +78,13 @@ func captureScreenshots() {
 	}
 }
 
-func writeASX(w http.ResponseWriter, channel Channel, baseURL string) {
-	fmt.Fprintf(w, `<ASX VERSION="1.0">
-<ENTRY>
-<TITLE>%s</TITLE>
-<AUTHOR>vinqttv</AUTHOR>
-<COPYRIGHT>(c) 2025</COPYRIGHT>
-<MOREINFO HREF="about:blank"/>
-<ABSTRACT>Live TV Stream</ABSTRACT>
-<REF HREF="%s/stream/%s"/>
-</ENTRY>
-</ASX>`, channel.Name, baseURL, channel.Slug)
+func writeSMIL(w http.ResponseWriter, channel Channel, baseURL string) {
+	fmt.Fprintf(w, `<!DOCTYPE smil PUBLIC "-//W3C//DTD SMIL 1.0//EN" "http://www.w3.org/TR/REC-smil/SMIL10.dtd">
+<smil>
+<body>
+<video src="%s/stream/%s"/>
+</body>
+</smil>`, baseURL, channel.Slug)
 }
 
 func findChannelBySlug(slug string) (*Channel, bool) {
@@ -109,17 +105,17 @@ func streamHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	cmd := exec.Command("ffmpeg", "-i", channel.URL,
-		"-c:v", "msmpeg4v1", "-c:a", "wmav1",
-		"-s", "176x144", "-b:v", "32k", "-maxrate", "32k", "-minrate", "32k",
-		"-r", "25", "-g", "25", "-qmin", "2", "-qmax", "10",
-		"-ar", "8000", "-ac", "1", "-b:a", "8k",
-		"-packetsize", "2324", "-chunk_size", "2324",
-		"-f", "asf", "-strict", "experimental",
+		"-c:v", "svq1", "-c:a", "adpcm_ima_qt",
+		"-s", "240x180", "-b:v", "75k",
+		"-r", "15", "-g", "15",
+		"-ar", "22050", "-ac", "1",
+		"-f", "mov",
+		"-vtag", "SVQ1",
 		"-")
 
 	cmd.Stdout = w
-	w.Header().Set("Content-Type", "application/x-ms-wmv")
-	w.Header().Set("Content-Disposition", "inline; filename=stream.asf")
+	w.Header().Set("Content-Type", "video/quicktime")
+	w.Header().Set("Content-Disposition", "inline; filename=stream.mov")
 
 	if err := cmd.Run(); err != nil {
 		log.Printf("Transcoding error: %v", err)
@@ -128,17 +124,17 @@ func streamHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func playlistHandler(w http.ResponseWriter, r *http.Request) {
-	slug := strings.TrimPrefix(r.URL.Path, "/playlist/")
-	slug = strings.TrimSuffix(slug, ".asx")
+func smilHandler(w http.ResponseWriter, r *http.Request) {
+	slug := strings.TrimPrefix(r.URL.Path, "/smil/")
+	slug = strings.TrimSuffix(slug, ".smi")
 	channel, found := findChannelBySlug(slug)
 	if !found {
 		http.NotFound(w, r)
 		return
 	}
 
-	w.Header().Set("Content-Type", "video/x-ms-asf")
-	writeASX(w, *channel, "http://"+r.Host)
+	w.Header().Set("Content-Type", "application/smil")
+	writeSMIL(w, *channel, "http://"+r.Host)
 }
 
 func checkFFmpeg() error {
@@ -167,7 +163,7 @@ func main() {
 	go captureScreenshots()
 
 	http.HandleFunc("/stream/", streamHandler)
-	http.HandleFunc("/playlist/", playlistHandler)
+	http.HandleFunc("/smil/", smilHandler)
 	http.Handle("/screenshots/", http.StripPrefix("/screenshots/", http.FileServer(http.Dir("screenshots"))))
 
 	tmpl := template.Must(template.New("index").Parse(indexHTML))
@@ -203,7 +199,7 @@ const indexHTML = `<!DOCTYPE html PUBLIC "-//W3C//DTD HTML 3.2//EN">
 <tr>
 <td>{{$channel.Name}}</td>
 <td><img src="/screenshots/{{$channel.Slug}}.jpg" width="160" height="90" alt="{{$channel.Name}} preview"></td>
-<td><a href="/playlist/{{$channel.Slug}}.asx">Watch in WMP</a></td>
+<td><a href="/smil/{{$channel.Slug}}.smi">Watch in QuickTime</a></td>
 </tr>
 {{end}}
 </table>
