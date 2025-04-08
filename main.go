@@ -44,6 +44,9 @@ const (
 	MMS_COMMAND_1F000000 = 0x1F000000
 	MMS_COMMAND_B0000000 = 0xB0000000
 	MMS_COMMAND_B1000000 = 0xB1000000
+	// Additional commands seen in WMPMac logs
+	MMS_COMMAND_3F000001 = 0x3F000001
+	MMS_COMMAND_4B000001 = 0x4B000001
 )
 
 // MMSHeader represents an MMS protocol header
@@ -226,6 +229,9 @@ func handleGenericMMSCommand(conn net.Conn, header MMSHeader, data []byte) {
 		respCmdID = MMS_CONNECT_RESP
 	case MMS_START_PLAY, MMS_COMMAND_1F000000:
 		respCmdID = MMS_START_PLAY_RESP
+	case MMS_COMMAND_3F000001, MMS_COMMAND_4B000001:
+		// Handle the WMPMac specific commands - these appear to be connect commands
+		respCmdID = MMS_CONNECT_RESP
 	default:
 		// For any other command, just acknowledge with connect response
 		respCmdID = MMS_CONNECT_RESP
@@ -309,7 +315,7 @@ func streamToMMSClient(conn net.Conn, channel *Channel) {
 			time.Sleep(200 * time.Millisecond)
 			info, err := os.Stat(tmpName)
 			if err == nil && info.Size() > 0 {
-				log.Printf("FFmpeg output file created with size: %d bytes", info.Size())
+				log.Printf("FFmpeg output file created with size: %d bytes")
 				outputReady <- true
 				return
 			}
