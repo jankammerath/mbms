@@ -50,6 +50,10 @@ const (
 	MMS_COMMAND_BB000001 = 0xBB000001
 	MMS_COMMAND_01000001 = 0x01000001
 
+	// Custom client commands observed in logs
+	MMS_COMMAND_44000001 = 0x44000001
+	MMS_COMMAND_FA000001 = 0xFA000001
+
 	// MMS protocol message types
 	MMS_MESSAGE_TYPE_DATA    = 0x00000000
 	MMS_MESSAGE_TYPE_END     = 0x00000001
@@ -362,6 +366,19 @@ func handleMMSConnection(conn net.Conn) {
 			clientState.PlayingFile = false
 			// No response needed for close file
 			return
+
+		// Added handlers for the custom commands seen in logs
+		case MMS_COMMAND_44000001:
+			// This appears to be a custom connect or init command from certain clients
+			log.Printf("Received custom connect command 0x44000001 from %s", remoteAddr)
+			// Respond with a standard connect response - most clients accept this
+			sendMMSConnectResponse(conn, header.SequenceNum)
+
+		case MMS_COMMAND_FA000001:
+			// This appears to be another custom connect or init command variant
+			log.Printf("Received custom connect command 0xFA000001 from %s", remoteAddr)
+			// Respond with a standard connect response - most clients accept this
+			sendMMSConnectResponse(conn, header.SequenceNum)
 
 		default:
 			// Handle other commands or malformed packets
