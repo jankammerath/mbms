@@ -46,6 +46,10 @@ const (
 	MMS_COMMAND_0F000000 = 0x0F000000
 	MMS_COMMAND_1F000000 = 0x1F000000
 
+	// Additional MMS commands seen in client connections
+	MMS_COMMAND_BB000001 = 0xBB000001
+	MMS_COMMAND_01000001 = 0x01000001
+
 	// MMS protocol message types
 	MMS_MESSAGE_TYPE_DATA    = 0x00000000
 	MMS_MESSAGE_TYPE_END     = 0x00000001
@@ -63,6 +67,25 @@ const (
 	MMS_START_PLAY      = MMS_LinkViewerToMacStartPlaying      // 0x00000007
 	MMS_DATA_PACKET     = MMS_LinkMacToViewerDataPacket        // 0x00000020
 	MMS_END_OF_STREAM   = MMS_LinkMacToViewerEndOfStream       // 0x00000021
+)
+
+// Additional MMS protocol message types for full protocol compliance
+const (
+	// FunnelInfo exchange (steps 3-4)
+	MMS_LinkViewerToMacFunnelInfo       = 0x0000000C
+	MMS_LinkMacToViewerReportFunnelInfo = 0x0000000D
+
+	// ConnectFunnel exchange (steps 5-6)
+	MMS_LinkViewerToMacConnectFunnel         = 0x0000000E
+	MMS_LinkMacToViewerReportConnectedFunnel = 0x0000000F
+
+	// StreamSwitch exchange (steps 11-12)
+	MMS_LinkViewerToMacStreamSwitch       = 0x00000033
+	MMS_LinkMacToViewerReportStreamSwitch = 0x00000021
+
+	// Logging and CloseFile (steps 17-18)
+	MMS_LinkViewerToMacLogging   = 0x0000001B
+	MMS_LinkViewerToMacCloseFile = 0x00000004
 )
 
 // MMSHeader represents an MMS protocol header
@@ -312,6 +335,33 @@ func handleMMSConnection(conn net.Conn) {
 			log.Printf("Client requesting to stop playback")
 			sendMMSStopPlayingResponse(conn, header.SequenceNum)
 			clientState.PlayingFile = false
+
+		case MMS_LinkViewerToMacFunnelInfo:
+			// Client requesting funnel info
+			log.Printf("Client requesting funnel info")
+			sendMMSFunnelInfoResponse(conn, header.SequenceNum)
+
+		case MMS_LinkViewerToMacConnectFunnel:
+			// Client requesting to connect funnel
+			log.Printf("Client requesting to connect funnel")
+			sendMMSConnectedFunnelResponse(conn, header.SequenceNum)
+
+		case MMS_LinkViewerToMacStreamSwitch:
+			// Client requesting stream switch
+			log.Printf("Client requesting stream switch")
+			sendMMSStreamSwitchResponse(conn, header.SequenceNum)
+
+		case MMS_LinkViewerToMacLogging:
+			// Client sending logging info
+			log.Printf("Client sending logging info")
+			// No response needed for logging messages
+
+		case MMS_LinkViewerToMacCloseFile:
+			// Client requesting to close file
+			log.Printf("Client requesting to close file")
+			clientState.PlayingFile = false
+			// No response needed for close file
+			return
 
 		default:
 			// Handle other commands or malformed packets
@@ -991,6 +1041,93 @@ func sendPreloadedASFHeader(conn net.Conn, clientState *MMSClientState) {
 
 	// Send header end notification
 	sendMMSHeaderEnd(conn)
+}
+
+// sendMMSFunnelInfoResponse sends a funnel info response to the client
+func sendMMSFunnelInfoResponse(conn net.Conn, seqNum uint32) {
+	response := MMSHeader{
+		CommandID:   MMS_LinkMacToViewerReportFunnelInfo,
+		Reserved1:   0,
+		Reserved2:   0,
+		MessageLen:  40, // Just the header size if no additional data
+		SequenceNum: seqNum + 1,
+		TimeoutVal:  0,
+		Reserved3:   0,
+		Reserved4:   0,
+		Reserved5:   0,
+		MessageLen2: 40,
+	}
+
+	respBuf := new(bytes.Buffer)
+	if err := binary.Write(respBuf, binary.LittleEndian, response); err != nil {
+		log.Printf("Error creating MMS funnel info response: %v", err)
+		return
+	}
+
+	if _, err := conn.Write(respBuf.Bytes()); err != nil {
+		log.Printf("Error sending MMS funnel info response: %v", err)
+		return
+	}
+
+	log.Printf("Sent MMS funnel info response (0x0000000D)")
+}
+
+// sendMMSConnectedFunnelResponse sends a connected funnel response to the client
+func sendMMSConnectedFunnelResponse(conn net.Conn, seqNum uint32) {
+	response := MMSHeader{
+		CommandID:   MMS_LinkMacToViewerReportConnectedFunnel,
+		Reserved1:   0,
+		Reserved2:   0,
+		MessageLen:  40, // Just the header size if no additional data
+		SequenceNum: seqNum + 1,
+		TimeoutVal:  0,
+		Reserved3:   0,
+		Reserved4:   0,
+		Reserved5:   0,
+		MessageLen2: 40,
+	}
+
+	respBuf := new(bytes.Buffer)
+	if err := binary.Write(respBuf, binary.LittleEndian, response); err != nil {
+		log.Printf("Error creating MMS connected funnel response: %v", err)
+		return
+	}
+
+	if _, err := conn.Write(respBuf.Bytes()); err != nil {
+		log.Printf("Error sending MMS connected funnel response: %v", err)
+		return
+	}
+
+	log.Printf("Sent MMS connected funnel response (0x0000000F)")
+}
+
+// sendMMSStreamSwitchResponse sends a stream switch response to the client
+func sendMMSStreamSwitchResponse(conn net.Conn, seqNum uint32) {
+	response := MMSHeader{
+		CommandID:   MMS_LinkMacToViewerReportStreamSwitch,
+		Reserved1:   0,
+		Reserved2:   0,
+		MessageLen:  40, // Just the header size if no additional data
+		SequenceNum: seqNum + 1,
+		TimeoutVal:  0,
+		Reserved3:   0,
+		Reserved4:   0,
+		Reserved5:   0,
+		MessageLen2: 40,
+	}
+
+	respBuf := new(bytes.Buffer)
+	if err := binary.Write(respBuf, binary.LittleEndian, response); err != nil {
+		log.Printf("Error creating MMS stream switch response: %v", err)
+		return
+	}
+
+	if _, err := conn.Write(respBuf.Bytes()); err != nil {
+		log.Printf("Error sending MMS stream switch response: %v", err)
+		return
+	}
+
+	log.Printf("Sent MMS stream switch response (0x00000021)")
 }
 
 func findChannelBySlug(slug string) (*Channel, bool) {
