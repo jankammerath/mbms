@@ -361,7 +361,6 @@ func handleMMSConnection(conn net.Conn) {
 			// No response needed for logging messages
 
 		case MMS_LinkViewerToMacCloseFile:
-			// Client requesting to close file
 			log.Printf("Client requesting to close file")
 			clientState.PlayingFile = false
 			// No response needed for close file
@@ -375,7 +374,7 @@ func handleMMSConnection(conn net.Conn) {
 			sendMMSConnectResponse(conn, header.SequenceNum)
 
 		case MMS_COMMAND_FA000001:
-			// This appears to be another custom connect or init command variant
+			// This appears to be a custom connect or init command variant
 			log.Printf("Received custom connect command 0xFA000001 from %s", remoteAddr)
 			// Respond with a standard connect response - most clients accept this
 			sendMMSConnectResponse(conn, header.SequenceNum)
@@ -384,33 +383,54 @@ func handleMMSConnection(conn net.Conn) {
 			// Handle other commands or malformed packets
 			log.Printf("Unhandled command from %s: 0x%08X", remoteAddr, header.CommandID)
 
-			// If no channel is selected yet, try to extract a channel from the data
-			if clientState.Channel == nil && n > 40 {
-				path := extractURLFromData(buf[40:n])
-				if path != "" {
-					channel := findChannelFromPath(path)
-					if channel != nil {
-						clientState.Channel = channel
-						log.Printf("Found channel from data: %s", channel.Name)
+			// Check for VLC-specific commands
+			if header.CommandID == 0x07 { // StartPlaying with seek position - VLC sends this during MMSStart
+				log.Printf("VLC client requesting to start playing/seeking (0x07) from %s", remoteAddr)
+				// VLC expects command 0x1e and then 0x05 in response to this
+				sendMMSSeekResponse(conn, header.SequenceNum)
+				sendMMSFileReadyResponse(conn, header.SequenceNum+1)
 
-						// For compatibility with older clients, proceed directly to streaming
+				if clientState.Channel != nil {
+					// Start streaming the content
+					clientState.PlayingFile = true
+					go streamToMMSClient(conn, clientState.Channel)
+					return
+				}
+			} else if header.CommandID == 0x33 { // Stream switch command - VLC sends this during stream selection
+				log.Printf("VLC client requesting stream switch (0x33) from %s", remoteAddr)
+				// Send correct stream switch response (0x21)
+				sendMMSStreamSwitchResponse(conn, header.SequenceNum)
+				// Then follow with a file ready response
+				sendMMSFileReadyResponse(conn, header.SequenceNum+1)
+			} else {
+				// If no channel is selected yet, try to extract a channel from the data
+				if clientState.Channel == nil && n > 40 {
+					path := extractURLFromData(buf[40:n])
+					if path != "" {
+						channel := findChannelFromPath(path)
+						if channel != nil {
+							clientState.Channel = channel
+							log.Printf("Found channel from data: %s", channel.Name)
+
+							// For compatibility with older clients, proceed directly to streaming
+							sendMMSConnectResponse(conn, header.SequenceNum)
+							clientState.PlayingFile = true
+							go streamToMMSClient(conn, clientState.Channel)
+							return
+						}
+					}
+
+					// If no channel found, use the first one (if available)
+					if clientState.Channel == nil && len(channels) > 0 {
+						ch := channels[0]
+						clientState.Channel = &ch
+						log.Printf("Using default channel: %s", ch.Name)
+
 						sendMMSConnectResponse(conn, header.SequenceNum)
 						clientState.PlayingFile = true
 						go streamToMMSClient(conn, clientState.Channel)
 						return
 					}
-				}
-
-				// If no channel found, use the first one (if available)
-				if clientState.Channel == nil && len(channels) > 0 {
-					ch := channels[0]
-					clientState.Channel = &ch
-					log.Printf("Using default channel: %s", ch.Name)
-
-					sendMMSConnectResponse(conn, header.SequenceNum)
-					clientState.PlayingFile = true
-					go streamToMMSClient(conn, clientState.Channel)
-					return
 				}
 			}
 		}
@@ -577,7 +597,7 @@ func streamToMMSClient(conn net.Conn, channel *Channel) {
 	tmpName := filepath.Join(tempDir, fmt.Sprintf("mms-stream-%s-%d.asf", channel.Slug, time.Now().UnixNano()))
 	log.Printf("Using temporary file: %s", tmpName)
 
-	// First, transcode to the temporary ASF file with improved options for WMP compatibility
+	// First, transcode to the temporary ASF file with improved options for better VLC compatibility
 	cmd := exec.Command("ffmpeg",
 		"-v", "info", // More verbose logging to diagnose issues
 		"-nostdin", // Don't expect stdin input to avoid hanging
@@ -587,18 +607,20 @@ func streamToMMSClient(conn net.Conn, channel *Channel) {
 		"-max_muxing_queue_size", "1024", // Handle larger input buffers
 		"-map", "0:v:0?", // Map only first video stream if available
 		"-map", "0:a:0?", // Map only first audio stream if available
-		"-c:v", "wmv1", // Use WMV1 codec for better WMP7 compatibility
-		"-b:v", "300k", // Reasonable video bitrate
+		"-c:v", "wmv2", // Use WMV2 codec for better VLC compatibility
+		"-b:v", "500k", // Higher video bitrate for VLC
 		"-r", "25", // 25 fps
-		"-g", "250", // Keyframe every 10 seconds
+		"-g", "125", // Keyframe every 5 seconds for better seeking
 		"-bf", "0", // No B-frames for better compatibility
-		"-c:a", "wmav1", // WMA version 1 for better compatibility
-		"-b:a", "64k", // Audio bitrate
+		"-c:a", "wmav2", // WMA version 2 for better audio quality
+		"-b:a", "128k", // Higher audio bitrate for better quality
 		"-ar", "44100", // Standard audio rate
 		"-ac", "2", // Stereo audio
-		"-vf", "scale=320:240", // Smaller resolution for better streaming
+		"-vf", "scale=480:360", // Better resolution for VLC
 		"-f", "asf", // Format for Windows Media
+		"-packetsize", "3000", // Larger packet size for VLC
 		"-asf_stream_properties", "parse_all=true", // Better ASF compatibility
+		"-fflags", "+genpts+ignidx",
 		"-y",    // Overwrite output file
 		tmpName) // Output file
 
@@ -645,7 +667,7 @@ func streamToMMSClient(conn net.Conn, channel *Channel) {
 	}
 
 	// Let FFmpeg finish creating the header
-	time.Sleep(1 * time.Second)
+	time.Sleep(2 * time.Second)
 
 	// If we get here, the file was created successfully
 	cmd.Process.Kill()
@@ -668,60 +690,132 @@ func streamToMMSClient(conn net.Conn, channel *Channel) {
 	defer file.Close()
 	defer os.Remove(tmpName)
 
-	// First, send a protocol selection message (if not already sent)
-	sendMMSProtocolSelection(conn)
-
-	// Send MMS file header start notification
-	sendMMSHeaderStart(conn)
-
-	// Send ASF header packets first
-	headerBuf := make([]byte, 8192) // Larger buffer for ASF header
-	n, err := file.Read(headerBuf)
+	// First, extract and send ASF header properly - VLC is very specific about this
+	// The ASF header is usually in the first few KB of the file
+	headerBuf := make([]byte, 16384) // Larger buffer to ensure we get the full ASF header
+	headerSize, err := file.Read(headerBuf)
 	if err != nil {
 		log.Printf("Error reading ASF header: %v", err)
 		return
 	}
 
-	// Send the ASF header as an MMS_DATA_PACKET using the LinkMacToViewerDataPacket command ID
-	header := MMSHeader{
-		CommandID:   MMS_LinkMacToViewerDataPacket, // Using standard MS-MMS command ID
+	// Find the ASF header boundaries - look for ASF header GUID
+	// ASF header starts with GUID: 30 26 B2 75 8E 66 CF 11 A6 D9 00 AA 00 62 CE 6C
+	asfHeaderStart := []byte{0x30, 0x26, 0xB2, 0x75, 0x8E, 0x66, 0xCF, 0x11, 0xA6, 0xD9, 0x00, 0xAA, 0x00, 0x62, 0xCE, 0x6C}
+	headerStartPos := bytes.Index(headerBuf[:headerSize], asfHeaderStart)
+
+	if headerStartPos < 0 {
+		log.Printf("Error: ASF header GUID not found in file")
+		return
+	}
+
+	// Extract the header size from the ASF header (assuming we found the header)
+	var asfHeaderSize int64
+	if headerStartPos+24 < headerSize {
+		// ASF header size is at offset 16 (0-based) from the header start and is 8 bytes
+		asfHeaderSize = int64(headerBuf[headerStartPos+16]) |
+			int64(headerBuf[headerStartPos+17])<<8 |
+			int64(headerBuf[headerStartPos+18])<<16 |
+			int64(headerBuf[headerStartPos+19])<<24 |
+			int64(headerBuf[headerStartPos+20])<<32 |
+			int64(headerBuf[headerStartPos+21])<<40 |
+			int64(headerBuf[headerStartPos+22])<<48 |
+			int64(headerBuf[headerStartPos+23])<<56
+	} else {
+		// If we can't find the header size, use a default
+		asfHeaderSize = 4096
+	}
+
+	log.Printf("ASF header found at position %d with size %d", headerStartPos, asfHeaderSize)
+
+	// Ensure we don't exceed the buffer or file size
+	if headerStartPos+int(asfHeaderSize) > headerSize {
+		asfHeaderSize = int64(headerSize - headerStartPos)
+	}
+
+	// Extract the actual ASF header
+	asfHeader := headerBuf[headerStartPos : headerStartPos+int(asfHeaderSize)]
+
+	// Send the MMS protocol header sequence that VLC expects
+	// This is crucial as VLC has very specific expectations for the sequence
+
+	// First send PROTOCOL_SELECTION (0x03) for VLC
+	protocolHeader := MMSHeader{
+		CommandID:   0x03, // Protocol Selection
 		Reserved1:   0,
 		Reserved2:   0,
-		MessageLen:  uint32(n + 40), // Add header size
-		SequenceNum: 0,              // Header is always packet 0
+		MessageLen:  44, // Standard header + 4 bytes for protocol info
+		SequenceNum: 0,
 		TimeoutVal:  0,
 		Reserved3:   0,
 		Reserved4:   0,
 		Reserved5:   0,
-		MessageLen2: uint32(n + 40),
+		MessageLen2: 44,
 	}
 
-	// Send header with proper MS-MMS data packet format
-	packetHeaderBuf := new(bytes.Buffer)
-	if err := binary.Write(packetHeaderBuf, binary.LittleEndian, header); err != nil {
-		log.Printf("Error creating MMS data packet header: %v", err)
+	protocolBuf := new(bytes.Buffer)
+	if err := binary.Write(protocolBuf, binary.LittleEndian, protocolHeader); err != nil {
+		log.Printf("Error creating protocol selection header: %v", err)
 		return
 	}
 
-	if _, err := conn.Write(packetHeaderBuf.Bytes()); err != nil {
-		log.Printf("Error sending MMS data packet header: %v", err)
+	// Add protocol selection data - VLC accepts TCP (0x00000001)
+	if err := binary.Write(protocolBuf, binary.LittleEndian, uint32(0x00000001)); err != nil {
+		log.Printf("Error adding protocol data: %v", err)
 		return
 	}
 
-	// Send actual ASF header data
-	if _, err := conn.Write(headerBuf[:n]); err != nil {
+	if _, err := conn.Write(protocolBuf.Bytes()); err != nil {
+		log.Printf("Error sending protocol selection: %v", err)
+		return
+	}
+
+	log.Printf("Sent protocol selection message")
+
+	// Send the ASF header as an MMS packet - VLC expects command 0x02 (header)
+	headerPacketHeader := MMSHeader{
+		CommandID:   0x02, // Header packet for VLC
+		Reserved1:   0,
+		Reserved2:   0,
+		MessageLen:  uint32(len(asfHeader) + 40), // Header data + MMS header
+		SequenceNum: 0,                           // Header packet is always 0
+		TimeoutVal:  0,
+		Reserved3:   0,
+		Reserved4:   0,
+		Reserved5:   0,
+		MessageLen2: uint32(len(asfHeader) + 40),
+	}
+
+	headerPacketBuf := new(bytes.Buffer)
+	if err := binary.Write(headerPacketBuf, binary.LittleEndian, headerPacketHeader); err != nil {
+		log.Printf("Error creating ASF header packet: %v", err)
+		return
+	}
+
+	if _, err := conn.Write(headerPacketBuf.Bytes()); err != nil {
+		log.Printf("Error sending ASF header packet header: %v", err)
+		return
+	}
+
+	if _, err := conn.Write(asfHeader); err != nil {
 		log.Printf("Error sending ASF header data: %v", err)
 		return
 	}
 
-	// Signal header end
-	sendMMSHeaderEnd(conn)
+	log.Printf("Sent ASF header packet (%d bytes)", len(asfHeader))
+
+	// Now stream the media data in properly formatted MMS packets
+	// Seek back to the beginning of the file + header size
+	if _, err := file.Seek(int64(headerStartPos+int(asfHeaderSize)), io.SeekStart); err != nil {
+		log.Printf("Error seeking in file: %v", err)
+		return
+	}
 
 	// Now send the actual data packets
 	log.Printf("Starting to stream file content to client")
-	packetSize := 4096
+	packetSize := 2048 // Adjust for VLC - some clients prefer smaller packets
 	buffer := make([]byte, packetSize)
-	packetNumber := uint32(1) // Start packet numbering after header packet
+	packetNumber := uint32(0) // Reset packet numbering for VLC
 
 	for {
 		n, err := file.Read(buffer)
@@ -734,12 +828,12 @@ func streamToMMSClient(conn net.Conn, channel *Channel) {
 			break
 		}
 
-		// Send as MMS data packet using proper MS-MMS command ID
-		header = MMSHeader{
-			CommandID:   MMS_LinkMacToViewerDataPacket, // Standard MS-MMS command ID
+		// Send as MMS data packet with command 0x04 (media data) for VLC
+		mediaHeader := MMSHeader{
+			CommandID:   0x04, // Media data packet for VLC
 			Reserved1:   0,
 			Reserved2:   0,
-			MessageLen:  uint32(n + 40), // Add header size
+			MessageLen:  uint32(n + 40), // Data size + MMS header
 			SequenceNum: packetNumber,   // Increment for each packet
 			TimeoutVal:  0,
 			Reserved3:   0,
@@ -748,38 +842,36 @@ func streamToMMSClient(conn net.Conn, channel *Channel) {
 			MessageLen2: uint32(n + 40),
 		}
 
-		// Send each packet with proper header
-		dataBuf := new(bytes.Buffer)
-		if err := binary.Write(dataBuf, binary.LittleEndian, header); err != nil {
-			log.Printf("Error creating MMS data packet header: %v", err)
+		mediaBuf := new(bytes.Buffer)
+		if err := binary.Write(mediaBuf, binary.LittleEndian, mediaHeader); err != nil {
+			log.Printf("Error creating media packet header: %v", err)
 			break
 		}
 
-		if _, err := conn.Write(dataBuf.Bytes()); err != nil {
-			log.Printf("Error sending MMS data packet header: %v", err)
+		if _, err := conn.Write(mediaBuf.Bytes()); err != nil {
+			log.Printf("Error sending media packet header: %v", err)
 			break
 		}
 
 		// Send the actual data
 		if _, err := conn.Write(buffer[:n]); err != nil {
-			log.Printf("Error sending MMS data packet data: %v", err)
+			log.Printf("Error sending media packet data: %v", err)
 			break
 		}
 
 		packetNumber++
 
-		// Small delay between packets to prevent overwhelming the client
-		// Adjust this value based on network conditions and client capabilities
-		time.Sleep(20 * time.Millisecond)
+		// Small delay between packets for VLC to process properly
+		time.Sleep(5 * time.Millisecond)
 	}
 
-	// Send end of stream marker with proper MS-MMS command ID
-	header = MMSHeader{
-		CommandID:   MMS_LinkMacToViewerEndOfStream, // Standard MS-MMS command ID
+	// Send end of stream marker with command 0x1E (end of stream) for VLC
+	eosHeader := MMSHeader{
+		CommandID:   0x1E, // End of Stream for VLC
 		Reserved1:   0,
 		Reserved2:   0,
-		MessageLen:  40,
-		SequenceNum: packetNumber, // Use next sequence number
+		MessageLen:  40, // Just the header
+		SequenceNum: packetNumber,
 		TimeoutVal:  0,
 		Reserved3:   0,
 		Reserved4:   0,
@@ -787,14 +879,14 @@ func streamToMMSClient(conn net.Conn, channel *Channel) {
 		MessageLen2: 40,
 	}
 
-	endBuf := new(bytes.Buffer)
-	if err := binary.Write(endBuf, binary.LittleEndian, header); err != nil {
-		log.Printf("Error creating MMS end of stream header: %v", err)
+	eosBuf := new(bytes.Buffer)
+	if err := binary.Write(eosBuf, binary.LittleEndian, eosHeader); err != nil {
+		log.Printf("Error creating end of stream header: %v", err)
 		return
 	}
 
-	if _, err := conn.Write(endBuf.Bytes()); err != nil {
-		log.Printf("Error sending MMS end of stream header: %v", err)
+	if _, err := conn.Write(eosBuf.Bytes()); err != nil {
+		log.Printf("Error sending end of stream header: %v", err)
 		return
 	}
 
@@ -1145,6 +1237,66 @@ func sendMMSStreamSwitchResponse(conn net.Conn, seqNum uint32) {
 	}
 
 	log.Printf("Sent MMS stream switch response (0x00000021)")
+}
+
+// sendMMSFileReadyResponse sends a file ready response (command 0x05)
+// This is specifically required for VLC clients
+func sendMMSFileReadyResponse(conn net.Conn, seqNum uint32) {
+	response := MMSHeader{
+		CommandID:   0x05, // File ready response expected by VLC
+		Reserved1:   0,
+		Reserved2:   0,
+		MessageLen:  40, // Just the header size
+		SequenceNum: seqNum,
+		TimeoutVal:  0,
+		Reserved3:   0,
+		Reserved4:   0,
+		Reserved5:   0,
+		MessageLen2: 40,
+	}
+
+	respBuf := new(bytes.Buffer)
+	if err := binary.Write(respBuf, binary.LittleEndian, response); err != nil {
+		log.Printf("Error creating MMS file ready response: %v", err)
+		return
+	}
+
+	if _, err := conn.Write(respBuf.Bytes()); err != nil {
+		log.Printf("Error sending MMS file ready response: %v", err)
+		return
+	}
+
+	log.Printf("Sent MMS file ready response (0x05)")
+}
+
+// sendMMSSeekResponse sends a seek response (command 0x1e)
+// This is specifically required for VLC clients after receiving command 0x07
+func sendMMSSeekResponse(conn net.Conn, seqNum uint32) {
+	response := MMSHeader{
+		CommandID:   0x1e, // Seek response expected by VLC
+		Reserved1:   0,
+		Reserved2:   0,
+		MessageLen:  40, // Just the header size
+		SequenceNum: seqNum,
+		TimeoutVal:  0,
+		Reserved3:   0,
+		Reserved4:   0,
+		Reserved5:   0,
+		MessageLen2: 40,
+	}
+
+	respBuf := new(bytes.Buffer)
+	if err := binary.Write(respBuf, binary.LittleEndian, response); err != nil {
+		log.Printf("Error creating MMS seek response: %v", err)
+		return
+	}
+
+	if _, err := conn.Write(respBuf.Bytes()); err != nil {
+		log.Printf("Error sending MMS seek response: %v", err)
+		return
+	}
+
+	log.Printf("Sent MMS seek response (0x1e)")
 }
 
 func findChannelBySlug(slug string) (*Channel, bool) {
